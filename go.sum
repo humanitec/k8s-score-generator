@@ -1,0 +1,6 @@
+github.com/score-spec/score-go/v2 v2.0.0-20261110193200-f67f00bdec36 h1:Q3y/sUghfYuASYqVNW2tAuRMqY5l+7ycvLmbUvAMP5w=
+github.com/score-spec/score-go/v2 v2.0.0-20261110193200-f67f00bdec36/go.mod h1:eFDRZc7HtE8Oc7iehGZvBGfH/qfJIYX8M6aJrLQcGBw=
+github.com/stretchr/testify v1.12.1 h1:EuwCh5fleGS7H32xRwO3wRGT7DxrDhLAT6FF8MpWDWE=
+github.com/stretchr/testify v1.12.1/go.mod h1:MDEgiDPPsNp5cuIrHPPCyornHKgEVbtFUmoNlxoYthg=
+go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
+go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
