@@ -27,7 +27,7 @@ import (
 
 func TestContainers(t *testing.T) {
 	https := score.HttpProbeScheme("HTTPS")
-	out, err := containers(score.WorkloadContainers{
+	b := &builder{workload: score.Workload{Containers: score.WorkloadContainers{
 		"main": {
 			Image: "busybox",
 			Resources: &score.ContainerResources{
@@ -44,7 +44,8 @@ func TestContainers(t *testing.T) {
 			ReadinessProbe: &score.ContainerProbe{Exec: &score.ExecProbe{Command: []string{"cat", "/tmp/ready"}}},
 		},
 		"minimal": {Image: "nginx"},
-	})
+	}}}
+	out, err := b.containers()
 	require.NoError(t, err)
 	assert.Equal(t, []corev1.Container{
 		{
@@ -101,7 +102,106 @@ func TestContainersErrors(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := containers(score.WorkloadContainers{"main": tc.container})
+			b := &builder{workload: score.Workload{Containers: score.WorkloadContainers{"main": tc.container}}}
+			_, err := b.containers()
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestEnvVars(t *testing.T) {
+	b := &builder{name: "app", substitutions: score.Substitutions{
+		"resources.db.host":     {Value: "10.0.0.5"},
+		"resources.db.port":     {Value: 5432},
+		"resources.db.tags":     {Value: map[string]any{"env": "dev"}},
+		"resources.db.none":     {},
+		"resources.db.user":     {Value: "admin"},
+		"resources.db.password": {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
+		"resources.db.pin":      {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: 1234}},
+	}}
+	env, err := b.envVars("main", score.ContainerVariables{
+		"PLAIN":   "plain",
+		"HOST":    "${resources.db.host}",
+		"URL":     "postgres://${resources.db.host}:${resources.db.port}/db",
+		"TAGS":    "${resources.db.tags}",
+		"EMPTY":   "${resources.db.none}",
+		"ESCAPED": "$${resources.db.password}",
+		"DSN":     "${resources.db.user}:${resources.db.password}@${resources.db.host}",
+		"DB PIN":  "${resources.db.pin}",
+	})
+	require.NoError(t, err)
+
+	secretRef := func(key string) *corev1.EnvVarSource {
+		return &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
+			Key:                  key,
+		}}
+	}
+	assert.Equal(t, []corev1.EnvVar{
+		{Name: "DB PIN", ValueFrom: secretRef("env.main.DB_PIN")},
+		{Name: "DSN", ValueFrom: secretRef("env.main.DSN")},
+		{Name: "EMPTY", Value: ""},
+		{Name: "ESCAPED", Value: "${resources.db.password}"},
+		{Name: "HOST", Value: "10.0.0.5"},
+		{Name: "PLAIN", Value: "plain"},
+		{Name: "TAGS", Value: `{"env":"dev"}`},
+		{Name: "URL", Value: "postgres://10.0.0.5:5432/db"},
+	}, env)
+	assert.Equal(t, map[string][]byte{
+		"env.main.DB_PIN": []byte("1234"),
+		"env.main.DSN":    []byte("admin:s3cr3t@10.0.0.5"),
+	}, b.secretData, "a variable with a secret placeholder is stored as a whole")
+}
+
+func TestEnvVarsErrors(t *testing.T) {
+	substitutions := score.Substitutions{
+		"resources.db.password": {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
+		"resources.db.empty":    {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: nil}},
+		"resources.db.vault":    {Secret: &score.SecretRef{Type: score.SecretTypeVault, Ref: "secret/db"}},
+	}
+	testCases := []struct {
+		name    string
+		vars    score.ContainerVariables
+		wantErr string
+	}{
+		{
+			name:    "missing substitution",
+			vars:    score.ContainerVariables{"X": "${resources.db.host}"},
+			wantErr: `containers.main.variables.X: resolving placeholder "resources.db.host": no substitution found`,
+		},
+		{
+			name:    "not a resources placeholder",
+			vars:    score.ContainerVariables{"X": "${metadata.name}"},
+			wantErr: `containers.main.variables.X: invalid placeholder: must start with "resources"`,
+		},
+		{
+			name:    "incomplete placeholder",
+			vars:    score.ContainerVariables{"X": "${resources.db.host"},
+			wantErr: "containers.main.variables.X: incomplete placeholder",
+		},
+		{
+			name:    "unsupported secret type",
+			vars:    score.ContainerVariables{"X": "${resources.db.vault}"},
+			wantErr: `containers.main.variables.X: placeholder ${resources.db.vault}: unsupported secret type "vault"`,
+		},
+		{
+			name:    "direct secret without value",
+			vars:    score.ContainerVariables{"X": "${resources.db.empty}"},
+			wantErr: "containers.main.variables.X: placeholder ${resources.db.empty}: direct secret has no value",
+		},
+		{
+			name:    "secret key collision",
+			vars:    score.ContainerVariables{"A B": "${resources.db.password}", "A_B": "${resources.db.password}"},
+			wantErr: `secret key "env.main.A_B" is already used by another variable`,
+		},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &builder{
+				workload:      score.Workload{Containers: score.WorkloadContainers{"main": {Variables: tc.vars}}},
+				substitutions: substitutions,
+			}
+			_, err := b.containers()
 			assert.ErrorContains(t, err, tc.wantErr)
 		})
 	}
