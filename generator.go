@@ -19,8 +19,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"slices"
-	"strings"
 
 	"github.com/score-spec/score-go/v2/score"
 	appsv1 "k8s.io/api/apps/v1"
@@ -58,6 +56,11 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Su
 		return nil, fmt.Errorf("a workload needs metadata.name")
 	}
 
+	podContainers, err := containers(spec.Containers)
+	if err != nil {
+		return nil, err
+	}
+
 	labels := map[string]string{NameLabel: name}
 	deployment := appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
@@ -66,7 +69,7 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Su
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
-				Spec:       corev1.PodSpec{Containers: containers(spec.Containers)},
+				Spec:       corev1.PodSpec{Containers: podContainers},
 			},
 		},
 	}
@@ -76,21 +79,4 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Su
 		return nil, fmt.Errorf("serializing the deployment to json: %w", err)
 	}
 	return map[string][]byte{DeploymentManifestKey: raw}, nil
-}
-
-// containers converts the Score containers, sorted by name so that the output is stable.
-func containers(in score.WorkloadContainers) []corev1.Container {
-	out := make([]corev1.Container, 0, len(in))
-	for name, c := range in {
-		out = append(out, corev1.Container{
-			Name:    name,
-			Image:   c.Image,
-			Command: c.Command,
-			Args:    c.Args,
-		})
-	}
-	slices.SortFunc(out, func(a, b corev1.Container) int {
-		return strings.Compare(a.Name, b.Name)
-	})
-	return out
 }
