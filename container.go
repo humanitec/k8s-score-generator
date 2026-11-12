@@ -15,7 +15,9 @@
 package k8s
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -25,10 +27,25 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// Variable names can potentially contain characters that are not allowed in Kubernetes secret keys.
+var illegalSecretKeyChars = regexp.MustCompile(`[^-._a-zA-Z0-9]`)
+
+// builder converts a Score workload into Kubernetes objects
+type builder struct {
+	workload      score.Workload
+	substitutions score.Substitutions
+	name          string
+	secretData    map[string][]byte
+}
+
 // containers converts the Score containers, sorted by name so that the output is stable.
-func containers(in score.WorkloadContainers) ([]corev1.Container, error) {
-	out := make([]corev1.Container, 0, len(in))
-	for name, c := range in {
+func (b *builder) containers() ([]corev1.Container, error) {
+	out := make([]corev1.Container, 0, len(b.workload.Containers))
+	for name, c := range b.workload.Containers {
+		env, err := b.envVars(name, c.Variables)
+		if err != nil {
+			return nil, fmt.Errorf("containers.%s.variables.%w", name, err)
+		}
 		resources, err := resourceRequirements(c.Resources)
 		if err != nil {
 			return nil, fmt.Errorf("containers.%s.resources.%w", name, err)
@@ -46,6 +63,7 @@ func containers(in score.WorkloadContainers) ([]corev1.Container, error) {
 			Image:          c.Image,
 			Command:        c.Command,
 			Args:           c.Args,
+			Env:            env,
 			Resources:      resources,
 			LivenessProbe:  livenessProbe,
 			ReadinessProbe: readinessProbe,
@@ -55,6 +73,100 @@ func containers(in score.WorkloadContainers) ([]corev1.Container, error) {
 		return strings.Compare(a.Name, b.Name)
 	})
 	return out, nil
+}
+
+// envVars converts the container variables, with their placeholders replaced, sorted by name.
+// A variable that uses a secret placeholder is stored in the Secret as a whole and referenced from it.
+func (b *builder) envVars(containerName string, vars score.ContainerVariables) ([]corev1.EnvVar, error) {
+	var out []corev1.EnvVar
+	for name, value := range vars {
+		expanded, secret, err := b.expand(value)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		if !secret {
+			out = append(out, corev1.EnvVar{Name: name, Value: expanded})
+			continue
+		}
+		key, err := b.addSecret("env."+containerName+"."+name, expanded)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", name, err)
+		}
+		out = append(out, corev1.EnvVar{
+			Name: name,
+			ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: b.name},
+				Key:                  key,
+			}},
+		})
+	}
+	slices.SortFunc(out, func(a, b corev1.EnvVar) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out, nil
+}
+
+// addSecret stores value in the Secret and returns its key.
+func (b *builder) addSecret(name, value string) (string, error) {
+	key := illegalSecretKeyChars.ReplaceAllString(name, "_")
+	if _, exists := b.secretData[key]; exists {
+		return "", fmt.Errorf("secret key %q is already used by another variable", key)
+	}
+	if b.secretData == nil {
+		b.secretData = map[string][]byte{}
+	}
+	b.secretData[key] = []byte(value)
+	return key, nil
+}
+
+// expand replaces the ${resources.*} placeholders in s with their substitutions and reports
+// whether any of them is a secret. A value that isn't a string is encoded as JSON.
+func (b *builder) expand(s string) (string, bool, error) {
+	values := map[string]string{}
+	secret := false
+	for _, placeholder := range getAllPlaceholdersInString(s) {
+		sub, err := b.substitutions.Resolve(placeholder)
+		if err != nil {
+			return "", false, err
+		}
+		if sub.Secret != nil {
+			secret = true
+			values[placeholder], err = secretValue(sub.Secret)
+		} else {
+			values[placeholder], err = toString(sub.Value)
+		}
+		if err != nil {
+			return "", false, fmt.Errorf("placeholder ${%s}: %w", placeholder, err)
+		}
+	}
+	expanded, err := replaceAllPlaceholdersInString(s, values)
+	return expanded, secret, err
+}
+
+// secretValue returns the value of a secret. Only direct secrets, which carry their value, are supported.
+func secretValue(secret *score.SecretRef) (string, error) {
+	if secret.Type != score.SecretTypeDirect {
+		// For now, we don't support secret references. Secrets are passed in the substitution map as flat values.
+		// In the future we may need to support secret references.
+		return "", fmt.Errorf("unsupported secret type %q", secret.Type)
+	}
+	if secret.Value == nil {
+		return "", fmt.Errorf("direct secret has no value")
+	}
+	return toString(secret.Value)
+}
+
+// toString returns a string as is, nil as an empty string and any other value encoded as JSON.
+func toString(v any) (string, error) {
+	switch v := v.(type) {
+	case nil:
+		return "", nil
+	case string:
+		return v, nil
+	default:
+		b, err := json.Marshal(v)
+		return string(b), err
+	}
 }
 
 func resourceRequirements(in *score.ContainerResources) (corev1.ResourceRequirements, error) {

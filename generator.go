@@ -17,6 +17,8 @@ package k8s
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 
@@ -27,11 +29,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// DeploymentManifestKey is the key of the Deployment manifest in the Generator's output.
-const DeploymentManifestKey = "deployment"
+const (
+	// DeploymentManifestKey manifest key to hold the Deployment. Always present.
+	DeploymentManifestKey = "deployment"
+	// SecretManifestKey manifest key to hold a Secret with the workload's secrets. Present only when the workload has any.
+	SecretManifestKey = "secret"
 
-// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
-const NameLabel = "app.kubernetes.io/name"
+	// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
+	NameLabel = "app.kubernetes.io/name"
+
+	// SecretChecksumAnnotation is the pod's annotation to hash its Secret's data, to restart the pod when secrets changed.
+	SecretChecksumAnnotation = "score.dev/secret-checksum"
+)
 
 // Generator generates Kubernetes manifests from a Score workload.
 type Generator struct{}
@@ -44,8 +53,8 @@ func NewGenerator() *Generator {
 }
 
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
-// It returns a Deployment, as JSON, named after metadata.name.
-func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Substitutions) (map[string][]byte, error) {
+// It returns a Deployment and a Secret (if the workload has secret values), both named after metadata.name.
+func (g *Generator) Generate(_ context.Context, spec *score.Workload, substitutions score.Substitutions) (map[string][]byte, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("no workload to generate Kubernetes manifests from")
 	}
@@ -56,27 +65,58 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Su
 	}
 	name, _ := spec.Metadata["name"].(string) // required and a string per the schema
 
-	podContainers, err := containers(spec.Containers)
+	manifests := map[string]any{}
+
+	b := &builder{workload: *spec, substitutions: substitutions, name: name}
+	podContainers, err := b.containers()
 	if err != nil {
 		return nil, err
 	}
 
 	labels := map[string]string{NameLabel: name}
-	deployment := appsv1.Deployment{
+	podMeta := metav1.ObjectMeta{Labels: labels}
+
+	if len(b.secretData) > 0 {
+		manifests[SecretManifestKey] = &corev1.Secret{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+			Type:       corev1.SecretTypeOpaque,
+			Data:       b.secretData,
+		}
+		checksum, err := secretChecksum(b.secretData)
+		if err != nil {
+			return nil, err
+		}
+		podMeta.Annotations = map[string]string{SecretChecksumAnnotation: checksum}
+	}
+
+	manifests[DeploymentManifestKey] = &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: podMeta,
 				Spec:       corev1.PodSpec{Containers: podContainers},
 			},
 		},
 	}
 
-	raw, err := json.Marshal(&deployment)
-	if err != nil {
-		return nil, fmt.Errorf("serializing the deployment to json: %w", err)
+	out := make(map[string][]byte, len(manifests))
+	for key, manifest := range manifests {
+		if out[key], err = json.Marshal(manifest); err != nil {
+			return nil, fmt.Errorf("serializing the %s manifest to json: %w", key, err)
+		}
 	}
-	return map[string][]byte{DeploymentManifestKey: raw}, nil
+	return out, nil
+}
+
+// secretChecksum returns a hash of the Secret data. json.Marshal sorts map keys, so it is stable.
+func secretChecksum(data map[string][]byte) (string, error) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("hashing the secret data: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
 }
