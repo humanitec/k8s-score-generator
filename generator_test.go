@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 func TestGenerate(t *testing.T) {
@@ -41,23 +42,28 @@ func TestGenerate(t *testing.T) {
 				Variables: score.ContainerVariables{"PASSWORD": "${resources.db.password}"},
 			},
 		},
+		Service: &score.WorkloadService{Ports: score.WorkloadServicePorts{
+			"http":    {Port: 80, TargetPort: new(8080)},
+			"metrics": {Port: 9090, Protocol: new(score.ServicePortProtocolUDP)},
+		}},
 	}
 	// generate runs Generate with the given substitutions and decodes the manifests.
-	generate := func(subs score.Substitutions) (appsv1.Deployment, *corev1.Secret) {
+	// The Secret and the Service are nil when they are not generated.
+	generate := func(subs score.Substitutions) (appsv1.Deployment, *corev1.Secret, *corev1.Service) {
 		t.Helper()
 		manifests, err := NewGenerator().Generate(t.Context(), &workload, subs)
 		require.NoError(t, err)
 		var deployment appsv1.Deployment
 		require.NoError(t, json.Unmarshal(manifests[DeploymentManifestKey], &deployment))
-		raw, ok := manifests[SecretManifestKey]
-		if !ok {
-			require.Len(t, manifests, 1)
-			return deployment, nil
+		var secret *corev1.Secret
+		if raw, ok := manifests[SecretManifestKey]; ok {
+			require.NoError(t, json.Unmarshal(raw, &secret))
 		}
-		require.Len(t, manifests, 2)
-		var secret corev1.Secret
-		require.NoError(t, json.Unmarshal(raw, &secret))
-		return deployment, &secret
+		var service *corev1.Service
+		if raw, ok := manifests[ServiceManifestKey]; ok {
+			require.NoError(t, json.Unmarshal(raw, &service))
+		}
+		return deployment, secret, service
 	}
 
 	// Generate successfully and check the output
@@ -65,7 +71,7 @@ func TestGenerate(t *testing.T) {
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 	}
-	deployment, secret := generate(subs)
+	deployment, secret, service := generate(subs)
 
 	labels := map[string]string{NameLabel: "app"}
 	assert.Equal(t, "apps/v1", deployment.APIVersion)
@@ -101,12 +107,23 @@ func TestGenerate(t *testing.T) {
 	checksum := deployment.Spec.Template.Annotations[SecretChecksumAnnotation]
 	assert.NotEmpty(t, checksum)
 
+	require.NotNil(t, service)
+	assert.Equal(t, "v1", service.APIVersion)
+	assert.Equal(t, "Service", service.Kind)
+	assert.Equal(t, "app", service.Name)
+	assert.Equal(t, labels, service.Labels)
+	assert.Equal(t, labels, service.Spec.Selector, "the selector must match the pod labels")
+	assert.Equal(t, []corev1.ServicePort{
+		{Name: "http", Port: 80, TargetPort: intstr.FromInt32(8080), Protocol: corev1.ProtocolTCP},
+		{Name: "metrics", Port: 9090, TargetPort: intstr.FromInt32(9090), Protocol: corev1.ProtocolUDP},
+	}, service.Spec.Ports, "ports are sorted by name, the target port defaults to the port and the protocol to TCP")
+
 	// Generate again with the same substitutions and check that the checksum didn't change
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 	}
-	same, _ := generate(subs)
+	same, _, _ := generate(subs)
 	assert.Equal(t, checksum, same.Spec.Template.Annotations[SecretChecksumAnnotation], "the checksum is stable")
 
 	// Generate again with a different secret value and check that the checksum changed
@@ -114,17 +131,19 @@ func TestGenerate(t *testing.T) {
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "changed"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 	}
-	changed, _ := generate(subs)
+	changed, _, _ := generate(subs)
 	assert.NotEqual(t, checksum, changed.Spec.Template.Annotations[SecretChecksumAnnotation], "a new secret value rolls out new pods")
 
-	// Generate again without secret values and check that there is no Secret and no checksum
+	// Generate again without secret values and service ports and check that there is no Secret, no checksum and no Service
+	workload.Service = nil
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Value: "not-a-secret"},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 	}
-	plain, secret := generate(subs)
+	plain, secret, service := generate(subs)
 	assert.Nil(t, secret, "no Secret without secret values")
 	assert.Empty(t, plain.Spec.Template.Annotations, "no checksum without a Secret")
+	assert.Nil(t, service, "no Service without service ports")
 }
 
 func TestGenerateErrors(t *testing.T) {

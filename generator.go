@@ -21,12 +21,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/score-spec/score-go/v2/schema"
 	"github.com/score-spec/score-go/v2/score"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -34,6 +37,8 @@ const (
 	DeploymentManifestKey = "deployment"
 	// SecretManifestKey manifest key to hold a Secret with the workload's secrets. Present only when the workload has any.
 	SecretManifestKey = "secret"
+	// ServiceManifestKey manifest key to hold a Service. Present only when the workload has service ports.
+	ServiceManifestKey = "service"
 
 	// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
 	NameLabel = "app.kubernetes.io/name"
@@ -53,7 +58,10 @@ func NewGenerator() *Generator {
 }
 
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
-// It returns a Deployment and a Secret (if the workload has secret values), both named after metadata.name.
+// It returns (all named after metadata.name):
+//   - a Deployment
+//   - a Secret, if the workload has secret values
+//   - a Service, if the workload has service ports
 func (g *Generator) Generate(_ context.Context, spec *score.Workload, substitutions score.Substitutions) (map[string][]byte, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("no workload to generate Kubernetes manifests from")
@@ -90,6 +98,17 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 		podMeta.Annotations = map[string]string{SecretChecksumAnnotation: checksum}
 	}
 
+	if spec.Service != nil && len(spec.Service.Ports) > 0 {
+		manifests[ServiceManifestKey] = &corev1.Service{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+			Spec: corev1.ServiceSpec{
+				Selector: labels,
+				Ports:    servicePorts(spec.Service.Ports),
+			},
+		}
+	}
+
 	manifests[DeploymentManifestKey] = &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
@@ -119,4 +138,29 @@ func secretChecksum(data map[string][]byte) (string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// servicePorts converts the Score service ports, sorted by name so that the output is stable.
+func servicePorts(ports score.WorkloadServicePorts) []corev1.ServicePort {
+	out := make([]corev1.ServicePort, 0, len(ports))
+	for name, scorePort := range ports {
+		targetPort := scorePort.Port
+		if scorePort.TargetPort != nil {
+			targetPort = *scorePort.TargetPort
+		}
+		protocol := corev1.ProtocolTCP
+		if scorePort.Protocol != nil {
+			protocol = corev1.Protocol(*scorePort.Protocol)
+		}
+		out = append(out, corev1.ServicePort{
+			Name:       name,
+			Port:       int32(scorePort.Port),
+			TargetPort: intstr.FromInt32(int32(targetPort)),
+			Protocol:   protocol,
+		})
+	}
+	slices.SortFunc(out, func(a, b corev1.ServicePort) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	return out
 }
