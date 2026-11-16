@@ -17,9 +17,21 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
+	"github.com/score-spec/score-go/v2/schema"
 	"github.com/score-spec/score-go/v2/score"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// DeploymentManifestKey is the key of the Deployment manifest in the Generator's output.
+const DeploymentManifestKey = "deployment"
+
+// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
+const NameLabel = "app.kubernetes.io/name"
 
 // Generator generates Kubernetes manifests from a Score workload.
 type Generator struct{}
@@ -32,7 +44,39 @@ func NewGenerator() *Generator {
 }
 
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
-// It is not implemented yet and returns no manifests.
-func (g *Generator) Generate(_ context.Context, _ *score.Workload, _ score.Substitutions) (map[string][]byte, error) {
-	return map[string][]byte{}, nil
+// It returns a Deployment, as JSON, named after metadata.name.
+func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Substitutions) (map[string][]byte, error) {
+	if spec == nil {
+		return nil, fmt.Errorf("no workload to generate Kubernetes manifests from")
+	}
+	// The Score schema is at least as strict as Kubernetes for the fields we use (metadata.name, container
+	// names, probe ports, resource quantities), so a valid spec produces a valid Deployment.
+	if err := schema.ValidateSpec(spec); err != nil {
+		return nil, fmt.Errorf("invalid score spec: %w", err)
+	}
+	name, _ := spec.Metadata["name"].(string) // required and a string per the schema
+
+	podContainers, err := containers(spec.Containers)
+	if err != nil {
+		return nil, err
+	}
+
+	labels := map[string]string{NameLabel: name}
+	deployment := appsv1.Deployment{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Spec: appsv1.DeploymentSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: labels},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				Spec:       corev1.PodSpec{Containers: podContainers},
+			},
+		},
+	}
+
+	raw, err := json.Marshal(&deployment)
+	if err != nil {
+		return nil, fmt.Errorf("serializing the deployment to json: %w", err)
+	}
+	return map[string][]byte{DeploymentManifestKey: raw}, nil
 }
