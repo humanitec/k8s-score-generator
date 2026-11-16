@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/score-spec/score-go/v2/schema"
 	"github.com/score-spec/score-go/v2/score"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -48,13 +49,12 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, _ score.Su
 	if spec == nil {
 		return nil, fmt.Errorf("no workload to generate Kubernetes manifests from")
 	}
-	if len(spec.Containers) == 0 {
-		return nil, fmt.Errorf("a workload needs at least one container")
+	// The Score schema is at least as strict as Kubernetes for the fields we use (metadata.name, container
+	// names, probe ports, resource quantities), so a valid spec produces a valid Deployment.
+	if err := schema.ValidateSpec(spec); err != nil {
+		return nil, fmt.Errorf("invalid score spec: %w", err)
 	}
-	name, _ := spec.Metadata["name"].(string)
-	if name == "" {
-		return nil, fmt.Errorf("a workload needs metadata.name")
-	}
+	name, _ := spec.Metadata["name"].(string) // required and a string per the schema
 
 	podContainers, err := containers(spec.Containers)
 	if err != nil {

@@ -27,7 +27,8 @@ import (
 
 func TestGenerateDeployment(t *testing.T) {
 	workload := score.Workload{
-		Metadata: score.WorkloadMetadata{"name": "app"},
+		ApiVersion: "score.dev/v1b1",
+		Metadata:   score.WorkloadMetadata{"name": "app"},
 		Containers: score.WorkloadContainers{
 			"web":     {Image: "nginx:1.27", Command: []string{"nginx"}, Args: []string{"-g", "daemon off;"}},
 			"sidecar": {Image: "busybox"},
@@ -61,22 +62,34 @@ func TestGenerateErrors(t *testing.T) {
 	}{
 		{name: "no workload", workload: nil, wantErr: "no workload"},
 		{
-			name:     "no containers",
-			workload: &score.Workload{Metadata: score.WorkloadMetadata{"name": "app"}},
-			wantErr:  "at least one container",
-		},
-		{
-			name:     "no name",
-			workload: &score.Workload{Containers: score.WorkloadContainers{"main": {Image: "busybox"}}},
-			wantErr:  "metadata.name",
-		},
-		{
-			name: "name is not a string",
+			name: "invalid metadata.name",
 			workload: &score.Workload{
-				Metadata:   score.WorkloadMetadata{"name": 42},
+				ApiVersion: "score.dev/v1b1",
+				Metadata:   score.WorkloadMetadata{"name": "My_App"},
 				Containers: score.WorkloadContainers{"main": {Image: "busybox"}},
 			},
-			wantErr: "metadata.name",
+			wantErr: "/metadata/name",
+		},
+		{
+			name: "invalid container name",
+			workload: &score.Workload{
+				ApiVersion: "score.dev/v1b1",
+				Metadata:   score.WorkloadMetadata{"name": "app"},
+				Containers: score.WorkloadContainers{"Web_1": {Image: "busybox"}},
+			},
+			wantErr: "/containers",
+		},
+		{
+			name: "probe port out of range",
+			workload: &score.Workload{
+				ApiVersion: "score.dev/v1b1",
+				Metadata:   score.WorkloadMetadata{"name": "app"},
+				Containers: score.WorkloadContainers{"main": {
+					Image:         "busybox",
+					LivenessProbe: &score.ContainerProbe{HttpGet: &score.HttpProbe{Path: "/", Port: 0}},
+				}},
+			},
+			wantErr: "/containers/main/livenessProbe/httpGet/port",
 		},
 	}
 	for _, tc := range testCases {
