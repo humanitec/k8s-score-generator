@@ -95,12 +95,17 @@ func TestGenerate(t *testing.T) {
 			}},
 		}}},
 		{
-			Name:         "web",
-			Image:        "nginx:1.27",
-			Command:      []string{"nginx"},
-			Args:         []string{"-g", "daemon off;"},
-			Env:          []corev1.EnvVar{{Name: "DB_HOST", Value: "hostname"}},
-			VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data", ReadOnly: true}},
+			Name:    "web",
+			Image:   "nginx:1.27",
+			Command: []string{"nginx"},
+			Args:    []string{"-g", "daemon off;"},
+			Env:     []corev1.EnvVar{{Name: "DB_HOST", Value: "hostname"}},
+			VolumeMounts: []corev1.VolumeMount{{
+				Name:              "data",
+				MountPath:         "/data",
+				ReadOnly:          true,
+				RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible),
+			}},
 		},
 	}, deployment.Spec.Template.Spec.Containers, "containers are sorted by name")
 	assert.Equal(t, []corev1.Volume{{

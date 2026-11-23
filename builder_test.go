@@ -70,7 +70,7 @@ func TestContainers(t *testing.T) {
 			Image: "busybox",
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "cache", MountPath: "/cache"},
-				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true},
+				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true, RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible)},
 				{Name: "data", MountPath: "/data"},
 			},
 			Resources: corev1.ResourceRequirements{
