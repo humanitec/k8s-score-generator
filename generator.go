@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -116,7 +117,13 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 			Selector: &metav1.LabelSelector{MatchLabels: labels},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: podMeta,
-				Spec:       corev1.PodSpec{Containers: podContainers},
+				Spec: corev1.PodSpec{
+					Containers: podContainers,
+					// Sorted by name so that the output is stable.
+					Volumes: slices.SortedFunc(maps.Values(b.volumes), func(x, y corev1.Volume) int {
+						return strings.Compare(x.Name, y.Name)
+					}),
+				},
 			},
 		},
 	}

@@ -27,30 +27,52 @@ import (
 
 func TestContainers(t *testing.T) {
 	https := score.HttpProbeScheme("HTTPS")
-	b := &builder{workload: score.Workload{Containers: score.WorkloadContainers{
-		"main": {
-			Image: "busybox",
-			Resources: &score.ContainerResources{
-				Requests: &score.ResourcesLimits{Cpu: new("250m"), Memory: new("64Mi")},
-				Limits:   &score.ResourcesLimits{Memory: new("128Mi")},
+	b := &builder{
+		workload: score.Workload{
+			Resources: score.WorkloadResources{
+				"data":  {Type: "volume"},
+				"cache": {Type: "volume"},
 			},
-			LivenessProbe: &score.ContainerProbe{HttpGet: &score.HttpProbe{
-				Path:        "/healthz",
-				Port:        8080,
-				Host:        new("localhost"),
-				Scheme:      &https,
-				HttpHeaders: []score.HttpProbeHttpHeadersElem{{Name: "X-Probe", Value: "1"}},
-			}},
-			ReadinessProbe: &score.ContainerProbe{Exec: &score.ExecProbe{Command: []string{"cat", "/tmp/ready"}}},
+			Containers: score.WorkloadContainers{
+				"main": {
+					Image: "busybox",
+					Volumes: score.ContainerVolumes{
+						"/data":   {Source: "${resources.data}"},
+						"/config": {Source: "${resources.data}", Path: new("config"), ReadOnly: new(true)},
+						"/cache":  {Source: "${resources.cache}", ReadOnly: new(false)},
+					},
+					Resources: &score.ContainerResources{
+						Requests: &score.ResourcesLimits{Cpu: new("250m"), Memory: new("64Mi")},
+						Limits:   &score.ResourcesLimits{Memory: new("128Mi")},
+					},
+					LivenessProbe: &score.ContainerProbe{HttpGet: &score.HttpProbe{
+						Path:        "/healthz",
+						Port:        8080,
+						Host:        new("localhost"),
+						Scheme:      &https,
+						HttpHeaders: []score.HttpProbeHttpHeadersElem{{Name: "X-Probe", Value: "1"}},
+					}},
+					ReadinessProbe: &score.ContainerProbe{Exec: &score.ExecProbe{Command: []string{"cat", "/tmp/ready"}}},
+				},
+				"minimal": {Image: "nginx"},
+			},
 		},
-		"minimal": {Image: "nginx"},
-	}}}
+		substitutions: score.Substitutions{
+			"resources.data":  {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}}}},
+			"resources.cache": {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
+		},
+	}
 	out, err := b.containers()
 	require.NoError(t, err)
 	assert.Equal(t, []corev1.Container{
 		{
 			Name:  "main",
 			Image: "busybox",
+			VolumeMounts: []corev1.VolumeMount{
+				{Name: "cache", MountPath: "/cache"},
+				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true},
+				{Name: "data", MountPath: "/data"},
+			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
 					corev1.ResourceCPU:    resource.MustParse("250m"),
@@ -70,7 +92,13 @@ func TestContainers(t *testing.T) {
 			}}},
 		},
 		{Name: "minimal", Image: "nginx"},
-	}, out)
+	}, out, "containers and volume mounts are sorted")
+	assert.Equal(t, map[string]corev1.Volume{
+		"cache": {Name: "cache", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
+		"data": {Name: "data", VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
+		}},
+	}, b.volumes, "a volume mounted twice is added once")
 }
 
 func TestContainersErrors(t *testing.T) {
@@ -199,6 +227,53 @@ func TestEnvVarsErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			b := &builder{
 				workload:      score.Workload{Containers: score.WorkloadContainers{"main": {Variables: tc.vars}}},
+				substitutions: substitutions,
+			}
+			_, err := b.containers()
+			assert.ErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestVolumeMountsErrors(t *testing.T) {
+	resources := score.WorkloadResources{
+		"data":        {Type: "volume"},
+		"db":          {Type: "postgres"},
+		"missing":     {Type: "volume"},
+		"no-platform": {Type: "volume"},
+		"not-object":  {Type: "volume"},
+		"typo":        {Type: "volume"},
+	}
+	substitutions := score.Substitutions{
+		"resources.data":        {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
+		"resources.db":          {Value: map[string]any{}},
+		"resources.no-platform": {Value: map[string]any{"google-cloud-run": map[string]any{"emptyDir": map[string]any{}}}},
+		"resources.not-object":  {Value: "pvc-data"},
+		"resources.typo":        {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClam": map[string]any{}}}},
+	}
+	testCases := []struct {
+		name    string
+		source  string
+		wantErr string
+	}{
+		{name: "not a placeholder", source: "data", wantErr: `containers.main.volumes./mnt: source must be ${resources.NAME}, got "data"`},
+		{name: "text around the placeholder", source: "${resources.data}/sub", wantErr: "source must be ${resources.NAME}"},
+		{name: "resource output", source: "${resources.data.path}", wantErr: "source must be ${resources.NAME}"},
+		{name: "not a resources placeholder", source: "${metadata.name}", wantErr: "source must be ${resources.NAME}"},
+		{name: "unknown resource", source: "${resources.unknown}", wantErr: "source ${resources.unknown} must reference a resource of type volume"},
+		{name: "not a volume resource", source: "${resources.db}", wantErr: "source ${resources.db} must reference a resource of type volume"},
+		{name: "missing substitution", source: "${resources.missing}", wantErr: `resolving placeholder "resources.missing": no substitution found`},
+		{name: "no kubernetes key", source: "${resources.no-platform}", wantErr: "must be an object with a kubernetes key holding a volume source"},
+		{name: "substitution not an object", source: "${resources.not-object}", wantErr: "must be an object with a kubernetes key holding a volume source"},
+		{name: "unknown field", source: "${resources.typo}", wantErr: `invalid volume source: json: unknown field "persistentVolumeClam"`},
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &builder{
+				workload: score.Workload{
+					Resources:  resources,
+					Containers: score.WorkloadContainers{"main": {Volumes: score.ContainerVolumes{"/mnt": {Source: tc.source}}}},
+				},
 				substitutions: substitutions,
 			}
 			_, err := b.containers()
