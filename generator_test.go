@@ -36,6 +36,7 @@ func TestGenerate(t *testing.T) {
 				Command:   []string{"nginx"},
 				Args:      []string{"-g", "daemon off;"},
 				Variables: score.ContainerVariables{"DB_HOST": "${resources.db.host}"},
+				Volumes:   score.ContainerVolumes{"/data": {Source: "${resources.data}", ReadOnly: new(true)}},
 			},
 			"sidecar": {
 				Image:     "busybox",
@@ -46,7 +47,11 @@ func TestGenerate(t *testing.T) {
 			"http":    {Port: 80, TargetPort: new(8080)},
 			"metrics": {Port: 9090, Protocol: new(score.ServicePortProtocolUDP)},
 		}},
+		Resources: score.WorkloadResources{"data": {Type: "volume"}},
 	}
+	dataVolume := score.SubValue{Value: map[string]any{
+		"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}},
+	}}
 	// generate runs Generate with the given substitutions and decodes the manifests.
 	// The Secret and the Service are nil when they are not generated.
 	generate := func(subs score.Substitutions) (appsv1.Deployment, *corev1.Secret, *corev1.Service) {
@@ -70,6 +75,7 @@ func TestGenerate(t *testing.T) {
 	subs := score.Substitutions{
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
+		"resources.data":        dataVolume,
 	}
 	deployment, secret, service := generate(subs)
 
@@ -89,13 +95,18 @@ func TestGenerate(t *testing.T) {
 			}},
 		}}},
 		{
-			Name:    "web",
-			Image:   "nginx:1.27",
-			Command: []string{"nginx"},
-			Args:    []string{"-g", "daemon off;"},
-			Env:     []corev1.EnvVar{{Name: "DB_HOST", Value: "hostname"}},
+			Name:         "web",
+			Image:        "nginx:1.27",
+			Command:      []string{"nginx"},
+			Args:         []string{"-g", "daemon off;"},
+			Env:          []corev1.EnvVar{{Name: "DB_HOST", Value: "hostname"}},
+			VolumeMounts: []corev1.VolumeMount{{Name: "data", MountPath: "/data", ReadOnly: true}},
 		},
 	}, deployment.Spec.Template.Spec.Containers, "containers are sorted by name")
+	assert.Equal(t, []corev1.Volume{{
+		Name:         "data",
+		VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}},
+	}}, deployment.Spec.Template.Spec.Volumes)
 
 	require.NotNil(t, secret)
 	assert.Equal(t, "v1", secret.APIVersion)
@@ -122,6 +133,7 @@ func TestGenerate(t *testing.T) {
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
+		"resources.data":        dataVolume,
 	}
 	same, _, _ := generate(subs)
 	assert.Equal(t, checksum, same.Spec.Template.Annotations[SecretChecksumAnnotation], "the checksum is stable")
@@ -130,6 +142,7 @@ func TestGenerate(t *testing.T) {
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "changed"}},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
+		"resources.data":        dataVolume,
 	}
 	changed, _, _ := generate(subs)
 	assert.NotEqual(t, checksum, changed.Spec.Template.Annotations[SecretChecksumAnnotation], "a new secret value rolls out new pods")
@@ -139,6 +152,7 @@ func TestGenerate(t *testing.T) {
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Value: "not-a-secret"},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
+		"resources.data":        dataVolume,
 	}
 	plain, secret, service := generate(subs)
 	assert.Nil(t, secret, "no Secret without secret values")

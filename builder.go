@@ -15,6 +15,7 @@
 package k8s
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -27,6 +28,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
+// Platform is the key of the Kubernetes spec in a resource's substitution. A substitution can hold
+// specs for several platforms, e.g. kubernetes and google-cloud-run.
+const Platform = "kubernetes"
+
+const volumeResourceType = "volume"
+
 // Variable names can potentially contain characters that are not allowed in Kubernetes secret keys.
 var illegalSecretKeyChars = regexp.MustCompile(`[^-._a-zA-Z0-9]`)
 
@@ -36,6 +43,7 @@ type builder struct {
 	substitutions score.Substitutions
 	name          string
 	secretData    map[string][]byte
+	volumes       map[string]corev1.Volume
 }
 
 // containers converts the Score containers, sorted by name so that the output is stable.
@@ -45,6 +53,10 @@ func (b *builder) containers() ([]corev1.Container, error) {
 		env, err := b.envVars(name, c.Variables)
 		if err != nil {
 			return nil, fmt.Errorf("containers.%s.variables.%w", name, err)
+		}
+		mounts, err := b.volumeMounts(c.Volumes)
+		if err != nil {
+			return nil, fmt.Errorf("containers.%s.volumes.%w", name, err)
 		}
 		resources, err := resourceRequirements(c.Resources)
 		if err != nil {
@@ -64,6 +76,7 @@ func (b *builder) containers() ([]corev1.Container, error) {
 			Command:        c.Command,
 			Args:           c.Args,
 			Env:            env,
+			VolumeMounts:   mounts,
 			Resources:      resources,
 			LivenessProbe:  livenessProbe,
 			ReadinessProbe: readinessProbe,
@@ -117,6 +130,83 @@ func (b *builder) addSecret(name, value string) (string, error) {
 	}
 	b.secretData[key] = []byte(value)
 	return key, nil
+}
+
+// volumeMounts converts the container volumes into mounts, sorted by path, and adds the volumes they mount to the pod.
+func (b *builder) volumeMounts(vols score.ContainerVolumes) ([]corev1.VolumeMount, error) {
+	var out []corev1.VolumeMount
+	for path, v := range vols {
+		name, err := b.addVolume(v.Source)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		mount := corev1.VolumeMount{Name: name, MountPath: path}
+		if v.Path != nil {
+			mount.SubPath = *v.Path
+		}
+		if v.ReadOnly != nil {
+			mount.ReadOnly = *v.ReadOnly
+		}
+		out = append(out, mount)
+	}
+	slices.SortFunc(out, func(a, b corev1.VolumeMount) int {
+		return strings.Compare(a.MountPath, b.MountPath)
+	})
+	return out, nil
+}
+
+// addVolume adds the volume to the pod and returns its name.
+//
+// A volume source must be ${resources.NAME}, with NAME a resource of type volume.
+// Its substitution is the whole resource: a value with a kubernetes key holding a
+// Kubernetes volume source, for example:
+//
+//	resources.data:
+//	  value:
+//	    kubernetes:
+//	      persistentVolumeClaim: {claimName: data}
+func (b *builder) addVolume(source string) (string, error) {
+	placeholders := getAllPlaceholdersInString(source)
+	if len(placeholders) != 1 || source != "${"+placeholders[0]+"}" {
+		return "", fmt.Errorf("source must be ${resources.NAME}, got %q", source)
+	}
+	name, ok := strings.CutPrefix(placeholders[0], "resources.")
+	if !ok || strings.Contains(name, ".") {
+		return "", fmt.Errorf("source must be ${resources.NAME}, got %q", source)
+	}
+	if res, exists := b.workload.Resources[name]; !exists || res.Type != volumeResourceType {
+		return "", fmt.Errorf("source %s must reference a resource of type %s", source, volumeResourceType)
+	}
+	if _, exists := b.volumes[name]; exists {
+		return name, nil
+	}
+
+	sub, err := b.substitutions.Resolve(placeholders[0])
+	if err != nil {
+		return "", err
+	}
+	value, _ := sub.Value.(map[string]any)
+	spec, ok := value[Platform].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("substitution for %s must be an object with a %s key holding a volume source", source, Platform)
+	}
+	// Decode strictly, so that an unknown field is an error rather than a volume without a source.
+	// Field names still match case-insensitively, as encoding/json always does.
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		return "", fmt.Errorf("substitution for %s: %w", source, err)
+	}
+	volume := corev1.Volume{Name: name}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&volume.VolumeSource); err != nil {
+		return "", fmt.Errorf("substitution for %s: invalid volume source: %w", source, err)
+	}
+	if b.volumes == nil {
+		b.volumes = map[string]corev1.Volume{}
+	}
+	b.volumes[name] = volume
+	return name, nil
 }
 
 // expand replaces the ${resources.*} placeholders in s with their substitutions and reports
