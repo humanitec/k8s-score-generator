@@ -16,10 +16,13 @@ package k8s
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/score-spec/score-go/v2/score"
@@ -34,6 +37,10 @@ const Platform = "kubernetes"
 
 const volumeResourceType = "volume"
 
+// filesVolumeName names the pod volume that mounts the container files from the Secret.
+// A volume resource can't have this name.
+const filesVolumeName = "files"
+
 // Variable names can potentially contain characters that are not allowed in Kubernetes secret keys.
 var illegalSecretKeyChars = regexp.MustCompile(`[^-._a-zA-Z0-9]`)
 
@@ -44,6 +51,7 @@ type builder struct {
 	name          string
 	secretData    map[string][]byte
 	volumes       map[string]corev1.Volume
+	fileItems     []corev1.KeyToPath
 }
 
 // containers converts the Score containers, sorted by name so that the output is stable.
@@ -58,6 +66,14 @@ func (b *builder) containers() ([]corev1.Container, error) {
 		if err != nil {
 			return nil, fmt.Errorf("containers.%s.volumes.%w", name, err)
 		}
+		fileMounts, err := b.fileMounts(name, c.Files)
+		if err != nil {
+			return nil, fmt.Errorf("containers.%s.files.%w", name, err)
+		}
+		mounts = append(mounts, fileMounts...)
+		slices.SortFunc(mounts, func(a, b corev1.VolumeMount) int {
+			return strings.Compare(a.MountPath, b.MountPath)
+		})
 		resources, err := resourceRequirements(c.Resources)
 		if err != nil {
 			return nil, fmt.Errorf("containers.%s.resources.%w", name, err)
@@ -85,6 +101,7 @@ func (b *builder) containers() ([]corev1.Container, error) {
 	slices.SortFunc(out, func(a, b corev1.Container) int {
 		return strings.Compare(a.Name, b.Name)
 	})
+	b.addFilesVolume()
 	return out, nil
 }
 
@@ -101,7 +118,7 @@ func (b *builder) envVars(containerName string, vars score.ContainerVariables) (
 			out = append(out, corev1.EnvVar{Name: name, Value: expanded})
 			continue
 		}
-		key, err := b.addSecret("env."+containerName+"."+name, expanded)
+		key, err := b.addSecret("env."+containerName+"."+name, []byte(expanded))
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -120,19 +137,85 @@ func (b *builder) envVars(containerName string, vars score.ContainerVariables) (
 }
 
 // addSecret stores value in the Secret and returns its key.
-func (b *builder) addSecret(name, value string) (string, error) {
+func (b *builder) addSecret(name string, value []byte) (string, error) {
 	key := illegalSecretKeyChars.ReplaceAllString(name, "_")
 	if _, exists := b.secretData[key]; exists {
-		return "", fmt.Errorf("secret key %q is already used by another variable", key)
+		return "", fmt.Errorf("secret key %q is already used by another variable or file", key)
 	}
 	if b.secretData == nil {
 		b.secretData = map[string][]byte{}
 	}
-	b.secretData[key] = []byte(value)
+	b.secretData[key] = value
 	return key, nil
 }
 
-// volumeMounts converts the container volumes into mounts, sorted by path, and adds the volumes they mount to the pod.
+// fileMounts stores the container files in the Secret and mounts each of them from the files volume.
+func (b *builder) fileMounts(containerName string, files score.ContainerFiles) ([]corev1.VolumeMount, error) {
+	var out []corev1.VolumeMount
+	// In sorted order, so that a potential error is always deterministic.
+	for _, path := range slices.Sorted(maps.Keys(files)) {
+		f := files[path]
+		content, err := b.fileContent(f)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		key, err := b.addSecret("file."+containerName+"."+path, content)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", path, err)
+		}
+		item := corev1.KeyToPath{Key: key, Path: key}
+		if f.Mode != nil {
+			mode, err := strconv.ParseInt(*f.Mode, 8, 32)
+			if err != nil || mode < 0 || mode > 0o777 {
+				return nil, fmt.Errorf("%s: mode must be an octal number from 0000 to 0777, got %q", path, *f.Mode)
+			}
+			item.Mode = new(int32(mode))
+		}
+		b.fileItems = append(b.fileItems, item)
+		out = append(out, corev1.VolumeMount{Name: filesVolumeName, MountPath: path, SubPath: key, ReadOnly: true})
+	}
+	return out, nil
+}
+
+// fileContent returns the content of a file. Placeholders in content are replaced unless noExpand is set.
+// binaryContent is base64 encoded and has no placeholders.
+func (b *builder) fileContent(f score.ContainerFile) ([]byte, error) {
+	switch {
+	case f.Content != nil && f.NoExpand != nil && *f.NoExpand:
+		return []byte(*f.Content), nil
+	case f.Content != nil:
+		expanded, _, err := b.expand(*f.Content)
+		return []byte(expanded), err
+	case f.BinaryContent != nil:
+		content, err := base64.StdEncoding.DecodeString(*f.BinaryContent)
+		if err != nil {
+			return nil, fmt.Errorf("binaryContent: %w", err)
+		}
+		return content, nil
+	default:
+		return nil, fmt.Errorf("content or binaryContent is required, source is not supported")
+	}
+}
+
+// addFilesVolume adds the volume with the container files to the pod, if there are any.
+// The items are sorted by key so that the output is stable.
+func (b *builder) addFilesVolume() {
+	if len(b.fileItems) == 0 {
+		return
+	}
+	slices.SortFunc(b.fileItems, func(a, b corev1.KeyToPath) int {
+		return strings.Compare(a.Key, b.Key)
+	})
+	if b.volumes == nil {
+		b.volumes = map[string]corev1.Volume{}
+	}
+	b.volumes[filesVolumeName] = corev1.Volume{
+		Name:         filesVolumeName,
+		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: b.name, Items: b.fileItems}},
+	}
+}
+
+// volumeMounts converts the container volumes into mounts and adds the volumes they mount to the pod.
 func (b *builder) volumeMounts(vols score.ContainerVolumes) ([]corev1.VolumeMount, error) {
 	var out []corev1.VolumeMount
 	for path, v := range vols {
@@ -151,9 +234,6 @@ func (b *builder) volumeMounts(vols score.ContainerVolumes) ([]corev1.VolumeMoun
 		}
 		out = append(out, mount)
 	}
-	slices.SortFunc(out, func(a, b corev1.VolumeMount) int {
-		return strings.Compare(a.MountPath, b.MountPath)
-	})
 	return out, nil
 }
 
@@ -178,6 +258,9 @@ func (b *builder) addVolume(source string) (string, error) {
 	}
 	if res, exists := b.workload.Resources[name]; !exists || res.Type != volumeResourceType {
 		return "", fmt.Errorf("source %s must reference a resource of type %s", source, volumeResourceType)
+	}
+	if name == filesVolumeName {
+		return "", fmt.Errorf("source %s: the volume name %q is reserved for container files", source, filesVolumeName)
 	}
 	if _, exists := b.volumes[name]; exists {
 		return name, nil
