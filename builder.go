@@ -144,8 +144,10 @@ func (b *builder) volumeMounts(vols score.ContainerVolumes) ([]corev1.VolumeMoun
 		if v.Path != nil {
 			mount.SubPath = *v.Path
 		}
-		if v.ReadOnly != nil {
-			mount.ReadOnly = *v.ReadOnly
+		if v.ReadOnly != nil && *v.ReadOnly {
+			mount.ReadOnly = true
+			// Also make submounts read-only where the node supports it. Kubernetes accepts this only with readOnly.
+			mount.RecursiveReadOnly = new(corev1.RecursiveReadOnlyIfPossible)
 		}
 		out = append(out, mount)
 	}
@@ -190,8 +192,6 @@ func (b *builder) addVolume(source string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("substitution for %s must be an object with a %s key holding a volume source", source, Platform)
 	}
-	// Decode strictly, so that an unknown field is an error rather than a volume without a source.
-	// Field names still match case-insensitively, as encoding/json always does.
 	raw, err := json.Marshal(spec)
 	if err != nil {
 		return "", fmt.Errorf("substitution for %s: %w", source, err)
