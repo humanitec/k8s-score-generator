@@ -36,7 +36,7 @@ import (
 const (
 	// DeploymentManifestKey manifest key to hold the Deployment. Always present.
 	DeploymentManifestKey = "deployment"
-	// SecretManifestKey manifest key to hold a Secret with the workload's secrets. Present only when the workload has any.
+	// SecretManifestKey manifest key to hold a Secret with the workload's secret values and files. Present only when the workload has any.
 	SecretManifestKey = "secret"
 	// ServiceManifestKey manifest key to hold a Service. Present only when the workload has service ports.
 	ServiceManifestKey = "service"
@@ -61,7 +61,7 @@ func NewGenerator() *Generator {
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
 // It returns (all named after metadata.name):
 //   - a Deployment
-//   - a Secret, if the workload has secret values
+//   - a Secret, if the workload has secret values or files
 //   - a Service, if the workload has service ports
 func (g *Generator) Generate(_ context.Context, spec *score.Workload, substitutions score.Substitutions) (map[string][]byte, error) {
 	if spec == nil {

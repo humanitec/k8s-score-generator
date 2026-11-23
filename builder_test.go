@@ -28,6 +28,7 @@ import (
 func TestContainers(t *testing.T) {
 	https := score.HttpProbeScheme("HTTPS")
 	b := &builder{
+		name: "app",
 		workload: score.Workload{
 			Resources: score.WorkloadResources{
 				"data":  {Type: "volume"},
@@ -40,6 +41,11 @@ func TestContainers(t *testing.T) {
 						"/data":   {Source: "${resources.data}"},
 						"/config": {Source: "${resources.data}", Path: new("config"), ReadOnly: new(true)},
 						"/cache":  {Source: "${resources.cache}", ReadOnly: new(false)},
+					},
+					Files: score.ContainerFiles{
+						"/etc/app/config.yaml":  {Content: new("host: ${resources.db.host}"), Mode: new("0600")},
+						"/etc/app/template.txt": {Content: new("host: ${resources.db.host}"), NoExpand: new(true)},
+						"/bin/tool":             {BinaryContent: new("AAE=")},
 					},
 					Resources: &score.ContainerResources{
 						Requests: &score.ResourcesLimits{Cpu: new("250m"), Memory: new("64Mi")},
@@ -58,8 +64,9 @@ func TestContainers(t *testing.T) {
 			},
 		},
 		substitutions: score.Substitutions{
-			"resources.data":  {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}}}},
-			"resources.cache": {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
+			"resources.data":    {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}}}},
+			"resources.cache":   {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
+			"resources.db.host": {Value: "10.0.0.5"},
 		},
 	}
 	out, err := b.containers()
@@ -69,9 +76,12 @@ func TestContainers(t *testing.T) {
 			Name:  "main",
 			Image: "busybox",
 			VolumeMounts: []corev1.VolumeMount{
+				{Name: "files", MountPath: "/bin/tool", SubPath: "file.main._bin_tool", ReadOnly: true},
 				{Name: "cache", MountPath: "/cache"},
 				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true, RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible)},
 				{Name: "data", MountPath: "/data"},
+				{Name: "files", MountPath: "/etc/app/config.yaml", SubPath: "file.main._etc_app_config.yaml", ReadOnly: true},
+				{Name: "files", MountPath: "/etc/app/template.txt", SubPath: "file.main._etc_app_template.txt", ReadOnly: true},
 			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -98,7 +108,20 @@ func TestContainers(t *testing.T) {
 		"data": {Name: "data", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
 		}},
-	}, b.volumes, "a volume mounted twice is added once")
+		"files": {Name: "files", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName: "app",
+			Items: []corev1.KeyToPath{
+				{Key: "file.main._bin_tool", Path: "file.main._bin_tool"},
+				{Key: "file.main._etc_app_config.yaml", Path: "file.main._etc_app_config.yaml", Mode: new(int32(0o600))},
+				{Key: "file.main._etc_app_template.txt", Path: "file.main._etc_app_template.txt"},
+			},
+		}}},
+	}, b.volumes, "a volume mounted twice is added once, all files share one volume")
+	assert.Equal(t, map[string][]byte{
+		"file.main._bin_tool":             {0x00, 0x01},
+		"file.main._etc_app_config.yaml":  []byte("host: 10.0.0.5"),
+		"file.main._etc_app_template.txt": []byte("host: ${resources.db.host}"),
+	}, b.secretData, "files are stored in the Secret")
 }
 
 func TestContainersErrors(t *testing.T) {
@@ -116,6 +139,39 @@ func TestContainersErrors(t *testing.T) {
 			name:      "invalid memory limit",
 			container: score.Container{Resources: &score.ContainerResources{Limits: &score.ResourcesLimits{Memory: new("1 GB")}}},
 			wantErr:   "containers.main.resources.limits.memory:",
+		},
+		{
+			name:      "file without inline content",
+			container: score.Container{Files: score.ContainerFiles{"/etc/app.conf": {Source: new("app.conf")}}},
+			wantErr:   "containers.main.files./etc/app.conf: content or binaryContent is required, source is not supported",
+		},
+		{
+			name:      "file with invalid binary content",
+			container: score.Container{Files: score.ContainerFiles{"/bin/tool": {BinaryContent: new("not base64")}}},
+			wantErr:   "containers.main.files./bin/tool: binaryContent:",
+		},
+		{
+			name:      "file content with missing substitution",
+			container: score.Container{Files: score.ContainerFiles{"/etc/app.conf": {Content: new("${resources.db.host}")}}},
+			wantErr:   `containers.main.files./etc/app.conf: resolving placeholder "resources.db.host": no substitution found`,
+		},
+		{
+			name:      "file mode not octal",
+			container: score.Container{Files: score.ContainerFiles{"/etc/app.conf": {Content: new("x"), Mode: new("0999")}}},
+			wantErr:   `containers.main.files./etc/app.conf: mode must be an octal number from 0000 to 0777, got "0999"`,
+		},
+		{
+			name:      "file mode too large",
+			container: score.Container{Files: score.ContainerFiles{"/etc/app.conf": {Content: new("x"), Mode: new("01000")}}},
+			wantErr:   `mode must be an octal number from 0000 to 0777, got "01000"`,
+		},
+		{
+			name: "file secret key collision",
+			container: score.Container{Files: score.ContainerFiles{
+				"/etc/app_config": {Content: new("a")},
+				"/etc/app/config": {Content: new("b")},
+			}},
+			wantErr: `containers.main.files./etc/app_config: secret key "file.main._etc_app_config" is already used by another variable or file`,
 		},
 		{
 			name:      "liveness probe without handler",
@@ -239,6 +295,7 @@ func TestVolumeMountsErrors(t *testing.T) {
 	resources := score.WorkloadResources{
 		"data":        {Type: "volume"},
 		"db":          {Type: "postgres"},
+		"files":       {Type: "volume"},
 		"missing":     {Type: "volume"},
 		"no-platform": {Type: "volume"},
 		"not-object":  {Type: "volume"},
@@ -262,6 +319,7 @@ func TestVolumeMountsErrors(t *testing.T) {
 		{name: "not a resources placeholder", source: "${metadata.name}", wantErr: "source must be ${resources.NAME}"},
 		{name: "unknown resource", source: "${resources.unknown}", wantErr: "source ${resources.unknown} must reference a resource of type volume"},
 		{name: "not a volume resource", source: "${resources.db}", wantErr: "source ${resources.db} must reference a resource of type volume"},
+		{name: "reserved volume name", source: "${resources.files}", wantErr: `source ${resources.files}: the volume name "files" is reserved for container files`},
 		{name: "missing substitution", source: "${resources.missing}", wantErr: `resolving placeholder "resources.missing": no substitution found`},
 		{name: "no kubernetes key", source: "${resources.no-platform}", wantErr: "must be an object with a kubernetes key holding a volume source"},
 		{name: "substitution not an object", source: "${resources.not-object}", wantErr: "must be an object with a kubernetes key holding a volume source"},
