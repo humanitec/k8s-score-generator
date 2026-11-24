@@ -37,12 +37,12 @@ const Platform = "kubernetes"
 
 const volumeResourceType = "volume"
 
-// filesVolumeName names the pod volume that mounts the container files from the Secret.
+// filesVolumeName names the pod volume that mounts the container files from the ConfigMap and the Secret.
 // A volume resource can't have this name.
 const filesVolumeName = "files"
 
-// Variable names can potentially contain characters that are not allowed in Kubernetes secret keys.
-var illegalSecretKeyChars = regexp.MustCompile(`[^-._a-zA-Z0-9]`)
+// Variable names and file paths can contain characters that are not allowed in Secret and ConfigMap keys.
+var illegalKeyChars = regexp.MustCompile(`[^-._a-zA-Z0-9]`)
 
 // builder converts a Score workload into Kubernetes objects
 type builder struct {
@@ -50,8 +50,10 @@ type builder struct {
 	substitutions score.Substitutions
 	name          string
 	secretData    map[string][]byte
+	configData    map[string][]byte
 	volumes       map[string]corev1.Volume
-	fileItems     []corev1.KeyToPath
+	secretItems   []corev1.KeyToPath
+	configItems   []corev1.KeyToPath
 }
 
 // containers converts the Score containers, sorted by name so that the output is stable.
@@ -118,7 +120,7 @@ func (b *builder) envVars(containerName string, vars score.ContainerVariables) (
 			out = append(out, corev1.EnvVar{Name: name, Value: expanded})
 			continue
 		}
-		key, err := b.addSecret("env."+containerName+"."+name, []byte(expanded))
+		key, err := b.addData("env."+containerName+"."+name, []byte(expanded), true)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -136,30 +138,41 @@ func (b *builder) envVars(containerName string, vars score.ContainerVariables) (
 	return out, nil
 }
 
-// addSecret stores value in the Secret and returns its key.
-func (b *builder) addSecret(name string, value []byte) (string, error) {
-	key := illegalSecretKeyChars.ReplaceAllString(name, "_")
-	if _, exists := b.secretData[key]; exists {
-		return "", fmt.Errorf("secret key %q is already used by another variable or file", key)
+// addData stores value in the Secret, or in the ConfigMap if it isn't secret, and returns its key.
+// A key is unique across both, because the files volume projects them into one directory.
+func (b *builder) addData(name string, value []byte, secret bool) (string, error) {
+	key := illegalKeyChars.ReplaceAllString(name, "_")
+	_, inSecret := b.secretData[key]
+	_, inConfig := b.configData[key]
+	if inSecret || inConfig {
+		return "", fmt.Errorf("key %q is already used by another variable or file", key)
 	}
-	if b.secretData == nil {
-		b.secretData = map[string][]byte{}
+	if secret {
+		if b.secretData == nil {
+			b.secretData = map[string][]byte{}
+		}
+		b.secretData[key] = value
+	} else {
+		if b.configData == nil {
+			b.configData = map[string][]byte{}
+		}
+		b.configData[key] = value
 	}
-	b.secretData[key] = value
 	return key, nil
 }
 
-// fileMounts stores the container files in the Secret and mounts each of them from the files volume.
+// fileMounts stores the container files and mounts each of them from the files volume. A file whose content
+// uses a secret placeholder is stored in the Secret, any other file in the ConfigMap.
 func (b *builder) fileMounts(containerName string, files score.ContainerFiles) ([]corev1.VolumeMount, error) {
 	var out []corev1.VolumeMount
 	// In sorted order, so that a potential error is always deterministic.
 	for _, path := range slices.Sorted(maps.Keys(files)) {
 		f := files[path]
-		content, err := b.fileContent(f)
+		content, secret, err := b.fileContent(f)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
-		key, err := b.addSecret("file."+containerName+"."+path, content)
+		key, err := b.addData("file."+containerName+"."+path, content, secret)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", path, err)
 		}
@@ -171,48 +184,69 @@ func (b *builder) fileMounts(containerName string, files score.ContainerFiles) (
 			}
 			item.Mode = new(int32(mode))
 		}
-		b.fileItems = append(b.fileItems, item)
+		if secret {
+			b.secretItems = append(b.secretItems, item)
+		} else {
+			b.configItems = append(b.configItems, item)
+		}
 		out = append(out, corev1.VolumeMount{Name: filesVolumeName, MountPath: path, SubPath: key, ReadOnly: true})
 	}
 	return out, nil
 }
 
-// fileContent returns the content of a file. Placeholders in content are replaced unless noExpand is set.
-// binaryContent is base64 encoded and has no placeholders.
-func (b *builder) fileContent(f score.ContainerFile) ([]byte, error) {
+// fileContent returns the content of a file and whether it holds a secret. Placeholders in content are
+// replaced unless noExpand is set. binaryContent is base64 encoded and has no placeholders.
+func (b *builder) fileContent(f score.ContainerFile) ([]byte, bool, error) {
 	switch {
 	case f.Content != nil && f.NoExpand != nil && *f.NoExpand:
-		return []byte(*f.Content), nil
+		return []byte(*f.Content), false, nil
 	case f.Content != nil:
-		expanded, _, err := b.expand(*f.Content)
-		return []byte(expanded), err
+		expanded, secret, err := b.expand(*f.Content)
+		return []byte(expanded), secret, err
 	case f.BinaryContent != nil:
 		content, err := base64.StdEncoding.DecodeString(*f.BinaryContent)
 		if err != nil {
-			return nil, fmt.Errorf("binaryContent: %w", err)
+			return nil, false, fmt.Errorf("binaryContent: %w", err)
 		}
-		return content, nil
+		return content, false, nil
 	default:
-		return nil, fmt.Errorf("content or binaryContent is required, source is not supported")
+		return nil, false, fmt.Errorf("content or binaryContent is required, source is not supported")
 	}
 }
 
-// addFilesVolume adds the volume with the container files to the pod, if there are any.
-// The items are sorted by key so that the output is stable.
+// addFilesVolume adds the volume with the container files to the pod, if there are any. It projects
+// the files from the ConfigMap and the Secret into one volume. The items are sorted by key so that
+// the output is stable.
 func (b *builder) addFilesVolume() {
-	if len(b.fileItems) == 0 {
+	var sources []corev1.VolumeProjection
+	if len(b.configItems) > 0 {
+		sources = append(sources, corev1.VolumeProjection{ConfigMap: &corev1.ConfigMapProjection{
+			LocalObjectReference: corev1.LocalObjectReference{Name: b.name},
+			Items:                sortedItems(b.configItems),
+		}})
+	}
+	if len(b.secretItems) > 0 {
+		sources = append(sources, corev1.VolumeProjection{Secret: &corev1.SecretProjection{
+			LocalObjectReference: corev1.LocalObjectReference{Name: b.name},
+			Items:                sortedItems(b.secretItems),
+		}})
+	}
+	if len(sources) == 0 {
 		return
 	}
-	slices.SortFunc(b.fileItems, func(a, b corev1.KeyToPath) int {
-		return strings.Compare(a.Key, b.Key)
-	})
 	if b.volumes == nil {
 		b.volumes = map[string]corev1.Volume{}
 	}
 	b.volumes[filesVolumeName] = corev1.Volume{
 		Name:         filesVolumeName,
-		VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: b.name, Items: b.fileItems}},
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: sources}},
 	}
+}
+
+func sortedItems(items []corev1.KeyToPath) []corev1.KeyToPath {
+	return slices.SortedFunc(slices.Values(items), func(a, b corev1.KeyToPath) int {
+		return strings.Compare(a.Key, b.Key)
+	})
 }
 
 // volumeMounts converts the container volumes into mounts and adds the volumes they mount to the pod.

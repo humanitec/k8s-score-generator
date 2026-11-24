@@ -43,8 +43,9 @@ func TestContainers(t *testing.T) {
 						"/cache":  {Source: "${resources.cache}", ReadOnly: new(false)},
 					},
 					Files: score.ContainerFiles{
-						"/etc/app/config.yaml":  {Content: new("host: ${resources.db.host}"), Mode: new("0600")},
-						"/etc/app/template.txt": {Content: new("host: ${resources.db.host}"), NoExpand: new(true)},
+						"/etc/app/config.yaml":  {Content: new("host: ${resources.db.host}"), Mode: new("0644")},
+						"/etc/app/secret.yaml":  {Content: new("password: ${resources.db.password}"), Mode: new("0600")},
+						"/etc/app/template.txt": {Content: new("password: ${resources.db.password}"), NoExpand: new(true)},
 						"/bin/tool":             {BinaryContent: new("AAE=")},
 					},
 					Resources: &score.ContainerResources{
@@ -64,9 +65,10 @@ func TestContainers(t *testing.T) {
 			},
 		},
 		substitutions: score.Substitutions{
-			"resources.data":    {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}}}},
-			"resources.cache":   {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
-			"resources.db.host": {Value: "10.0.0.5"},
+			"resources.data":        {Value: map[string]any{"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}}}},
+			"resources.cache":       {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
+			"resources.db.host":     {Value: "10.0.0.5"},
+			"resources.db.password": {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
 		},
 	}
 	out, err := b.containers()
@@ -81,6 +83,7 @@ func TestContainers(t *testing.T) {
 				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true, RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible)},
 				{Name: "data", MountPath: "/data"},
 				{Name: "files", MountPath: "/etc/app/config.yaml", SubPath: "file.main._etc_app_config.yaml", ReadOnly: true},
+				{Name: "files", MountPath: "/etc/app/secret.yaml", SubPath: "file.main._etc_app_secret.yaml", ReadOnly: true},
 				{Name: "files", MountPath: "/etc/app/template.txt", SubPath: "file.main._etc_app_template.txt", ReadOnly: true},
 			},
 			Resources: corev1.ResourceRequirements{
@@ -108,20 +111,33 @@ func TestContainers(t *testing.T) {
 		"data": {Name: "data", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
 		}},
-		"files": {Name: "files", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-			SecretName: "app",
-			Items: []corev1.KeyToPath{
-				{Key: "file.main._bin_tool", Path: "file.main._bin_tool"},
-				{Key: "file.main._etc_app_config.yaml", Path: "file.main._etc_app_config.yaml", Mode: new(int32(0o600))},
-				{Key: "file.main._etc_app_template.txt", Path: "file.main._etc_app_template.txt"},
+		"files": {Name: "files", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			Sources: []corev1.VolumeProjection{
+				{ConfigMap: &corev1.ConfigMapProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
+					Items: []corev1.KeyToPath{
+						{Key: "file.main._bin_tool", Path: "file.main._bin_tool"},
+						{Key: "file.main._etc_app_config.yaml", Path: "file.main._etc_app_config.yaml", Mode: new(int32(0o644))},
+						{Key: "file.main._etc_app_template.txt", Path: "file.main._etc_app_template.txt"},
+					},
+				}},
+				{Secret: &corev1.SecretProjection{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
+					Items: []corev1.KeyToPath{
+						{Key: "file.main._etc_app_secret.yaml", Path: "file.main._etc_app_secret.yaml", Mode: new(int32(0o600))},
+					},
+				}},
 			},
 		}}},
 	}, b.volumes, "a volume mounted twice is added once, all files share one volume")
 	assert.Equal(t, map[string][]byte{
 		"file.main._bin_tool":             {0x00, 0x01},
 		"file.main._etc_app_config.yaml":  []byte("host: 10.0.0.5"),
-		"file.main._etc_app_template.txt": []byte("host: ${resources.db.host}"),
-	}, b.secretData, "files are stored in the Secret")
+		"file.main._etc_app_template.txt": []byte("password: ${resources.db.password}"),
+	}, b.configData, "files without secret values are stored in the ConfigMap")
+	assert.Equal(t, map[string][]byte{
+		"file.main._etc_app_secret.yaml": []byte("password: s3cr3t"),
+	}, b.secretData, "files with secret values are stored in the Secret")
 }
 
 func TestContainersErrors(t *testing.T) {
@@ -166,12 +182,12 @@ func TestContainersErrors(t *testing.T) {
 			wantErr:   `mode must be an octal number from 0000 to 0777, got "01000"`,
 		},
 		{
-			name: "file secret key collision",
+			name: "file key collision between the Secret and the ConfigMap",
 			container: score.Container{Files: score.ContainerFiles{
 				"/etc/app_config": {Content: new("a")},
-				"/etc/app/config": {Content: new("b")},
+				"/etc/app/config": {Content: new("${resources.db.password}")},
 			}},
-			wantErr: `containers.main.files./etc/app_config: secret key "file.main._etc_app_config" is already used by another variable or file`,
+			wantErr: `containers.main.files./etc/app_config: key "file.main._etc_app_config" is already used by another variable or file`,
 		},
 		{
 			name:      "liveness probe without handler",
@@ -186,7 +202,12 @@ func TestContainersErrors(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			b := &builder{workload: score.Workload{Containers: score.WorkloadContainers{"main": tc.container}}}
+			b := &builder{
+				workload: score.Workload{Containers: score.WorkloadContainers{"main": tc.container}},
+				substitutions: score.Substitutions{
+					"resources.db.password": {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
+				},
+			}
 			_, err := b.containers()
 			assert.ErrorContains(t, err, tc.wantErr)
 		})
@@ -276,7 +297,7 @@ func TestEnvVarsErrors(t *testing.T) {
 		{
 			name:    "secret key collision",
 			vars:    score.ContainerVariables{"A B": "${resources.db.password}", "A_B": "${resources.db.password}"},
-			wantErr: `secret key "env.main.A_B" is already used by another variable`,
+			wantErr: `key "env.main.A_B" is already used by another variable or file`,
 		},
 	}
 	for _, tc := range testCases {
