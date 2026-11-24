@@ -24,6 +24,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/score-spec/score-go/v2/schema"
 	"github.com/score-spec/score-go/v2/score"
@@ -36,16 +37,21 @@ import (
 const (
 	// DeploymentManifestKey manifest key to hold the Deployment. Always present.
 	DeploymentManifestKey = "deployment"
-	// SecretManifestKey manifest key to hold a Secret with the workload's secret values and files. Present only when the workload has any.
+	// SecretManifestKey manifest key to hold a Secret with the workload's secret values and the files that use them.
+	// Present only when the workload has any.
 	SecretManifestKey = "secret"
+	// ConfigMapManifestKey manifest key to hold a ConfigMap with the workload's files without secret values.
+	// Present only when the workload has any.
+	ConfigMapManifestKey = "configmap"
 	// ServiceManifestKey manifest key to hold a Service. Present only when the workload has service ports.
 	ServiceManifestKey = "service"
 
 	// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
 	NameLabel = "app.kubernetes.io/name"
 
-	// SecretChecksumAnnotation is the pod's annotation to hash its Secret's data, to restart the pod when secrets changed.
-	SecretChecksumAnnotation = "score.dev/secret-checksum"
+	// ConfigChecksumAnnotation is the pod's annotation to hash the data of its Secret and ConfigMap, to restart
+	// the pod when values or files changed.
+	ConfigChecksumAnnotation = "score.dev/config-checksum"
 )
 
 // Generator generates Kubernetes manifests from a Score workload.
@@ -61,7 +67,8 @@ func NewGenerator() *Generator {
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
 // It returns (all named after metadata.name):
 //   - a Deployment
-//   - a Secret, if the workload has secret values or files
+//   - a Secret, if the workload has secret values or files with secret values
+//   - a ConfigMap, if the workload has files without secret values
 //   - a Service, if the workload has service ports
 func (g *Generator) Generate(_ context.Context, spec *score.Workload, substitutions score.Substitutions) (map[string][]byte, error) {
 	if spec == nil {
@@ -92,11 +99,36 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 			Type:       corev1.SecretTypeOpaque,
 			Data:       b.secretData,
 		}
-		checksum, err := secretChecksum(b.secretData)
+	}
+
+	if len(b.configData) > 0 {
+		configMap := &corev1.ConfigMap{
+			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
+			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		}
+		// data holds UTF-8 strings only, so any other content goes to binaryData.
+		for key, value := range b.configData {
+			if utf8.Valid(value) {
+				if configMap.Data == nil {
+					configMap.Data = map[string]string{}
+				}
+				configMap.Data[key] = string(value)
+			} else {
+				if configMap.BinaryData == nil {
+					configMap.BinaryData = map[string][]byte{}
+				}
+				configMap.BinaryData[key] = value
+			}
+		}
+		manifests[ConfigMapManifestKey] = configMap
+	}
+
+	if len(b.secretData) > 0 || len(b.configData) > 0 {
+		checksum, err := configChecksum(b.secretData, b.configData)
 		if err != nil {
 			return nil, err
 		}
-		podMeta.Annotations = map[string]string{SecretChecksumAnnotation: checksum}
+		podMeta.Annotations = map[string]string{ConfigChecksumAnnotation: checksum}
 	}
 
 	if spec.Service != nil && len(spec.Service.Ports) > 0 {
@@ -137,11 +169,11 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 	return out, nil
 }
 
-// secretChecksum returns a hash of the Secret data. json.Marshal sorts map keys, so it is stable.
-func secretChecksum(data map[string][]byte) (string, error) {
-	raw, err := json.Marshal(data)
+// configChecksum returns a hash of the Secret and ConfigMap data. json.Marshal sorts map keys, so it is stable.
+func configChecksum(secretData, configData map[string][]byte) (string, error) {
+	raw, err := json.Marshal([]map[string][]byte{secretData, configData})
 	if err != nil {
-		return "", fmt.Errorf("hashing the secret data: %w", err)
+		return "", fmt.Errorf("hashing the secret and config data: %w", err)
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
