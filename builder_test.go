@@ -78,13 +78,13 @@ func TestContainers(t *testing.T) {
 			Name:  "main",
 			Image: "busybox",
 			VolumeMounts: []corev1.VolumeMount{
-				{Name: "files", MountPath: "/bin/tool", SubPath: "file.main._bin_tool", ReadOnly: true},
+				{Name: "file-2031ebf787", MountPath: "/bin/tool", SubPath: "tool", ReadOnly: true},
 				{Name: "cache", MountPath: "/cache"},
 				{Name: "data", MountPath: "/config", SubPath: "config", ReadOnly: true, RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible)},
 				{Name: "data", MountPath: "/data"},
-				{Name: "files", MountPath: "/etc/app/config.yaml", SubPath: "file.main._etc_app_config.yaml", ReadOnly: true},
-				{Name: "files", MountPath: "/etc/app/secret.yaml", SubPath: "file.main._etc_app_secret.yaml", ReadOnly: true},
-				{Name: "files", MountPath: "/etc/app/template.txt", SubPath: "file.main._etc_app_template.txt", ReadOnly: true},
+				{Name: "file-782352c4e0", MountPath: "/etc/app/config.yaml", SubPath: "config.yaml", ReadOnly: true},
+				{Name: "file-4abb8b2beb", MountPath: "/etc/app/secret.yaml", SubPath: "secret.yaml", ReadOnly: true},
+				{Name: "file-6f9f7b4538", MountPath: "/etc/app/template.txt", SubPath: "template.txt", ReadOnly: true},
 			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -111,33 +111,40 @@ func TestContainers(t *testing.T) {
 		"data": {Name: "data", VolumeSource: corev1.VolumeSource{
 			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"},
 		}},
-		"files": {Name: "files", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
-			Sources: []corev1.VolumeProjection{
-				{ConfigMap: &corev1.ConfigMapProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
-					Items: []corev1.KeyToPath{
-						{Key: "file.main._bin_tool", Path: "file.main._bin_tool"},
-						{Key: "file.main._etc_app_config.yaml", Path: "file.main._etc_app_config.yaml", Mode: new(int32(0o644))},
-						{Key: "file.main._etc_app_template.txt", Path: "file.main._etc_app_template.txt"},
-					},
-				}},
-				{Secret: &corev1.SecretProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
-					Items: []corev1.KeyToPath{
-						{Key: "file.main._etc_app_secret.yaml", Path: "file.main._etc_app_secret.yaml", Mode: new(int32(0o600))},
-					},
-				}},
-			},
+		"file-2031ebf787": {Name: "file-2031ebf787", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-2031ebf787"},
 		}}},
-	}, b.volumes, "a volume mounted twice is added once, all files share one volume")
-	assert.Equal(t, map[string][]byte{
-		"file.main._bin_tool":             {0x00, 0x01},
-		"file.main._etc_app_config.yaml":  []byte("host: 10.0.0.5"),
-		"file.main._etc_app_template.txt": []byte("password: ${resources.db.password}"),
-	}, b.configData, "files without secret values are stored in the ConfigMap")
-	assert.Equal(t, map[string][]byte{
-		"file.main._etc_app_secret.yaml": []byte("password: s3cr3t"),
-	}, b.secretData, "files with secret values are stored in the Secret")
+		"file-782352c4e0": {Name: "file-782352c4e0", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-782352c4e0"},
+			DefaultMode:          new(int32(0o644)),
+		}}},
+		"file-4abb8b2beb": {Name: "file-4abb8b2beb", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+			SecretName:  "app-file-4abb8b2beb",
+			DefaultMode: new(int32(0o600)),
+		}}},
+		"file-6f9f7b4538": {Name: "file-6f9f7b4538", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-6f9f7b4538"},
+		}}},
+	}, b.volumes, "a volume mounted twice is added once, each file has its own volume")
+	contents := map[string]string{}
+	secrets := map[string]bool{}
+	for _, f := range b.files {
+		contents[f.object+"/"+f.key] = string(f.content)
+		secrets[f.object] = f.secret
+	}
+	assert.Equal(t, map[string]string{
+		"app-file-2031ebf787/tool":         "\x00\x01",
+		"app-file-782352c4e0/config.yaml":  "host: 10.0.0.5",
+		"app-file-4abb8b2beb/secret.yaml":  "password: s3cr3t",
+		"app-file-6f9f7b4538/template.txt": "password: ${resources.db.password}",
+	}, contents, "each file is stored under its base name")
+	assert.Equal(t, map[string]bool{
+		"app-file-2031ebf787": false,
+		"app-file-782352c4e0": false,
+		"app-file-4abb8b2beb": true,
+		"app-file-6f9f7b4538": false,
+	}, secrets, "only a file with a secret value is stored in a Secret")
+	assert.Empty(t, b.secretData, "files are not stored in the variables' Secret")
 }
 
 func TestContainersErrors(t *testing.T) {
@@ -182,12 +189,12 @@ func TestContainersErrors(t *testing.T) {
 			wantErr:   `mode must be an octal number from 0000 to 0777, got "01000"`,
 		},
 		{
-			name: "file key collision between the Secret and the ConfigMap",
-			container: score.Container{Files: score.ContainerFiles{
-				"/etc/app_config": {Content: new("a")},
-				"/etc/app/config": {Content: new("${resources.db.password}")},
-			}},
-			wantErr: `containers.main.files./etc/app_config: key "file.main._etc_app_config" is already used by another variable or file`,
+			name: "file volume name used by a volume resource",
+			container: score.Container{
+				Volumes: score.ContainerVolumes{"/data": {Source: "${resources.file-3e43d1ed18}"}},
+				Files:   score.ContainerFiles{"/etc/app.conf": {Content: new("x")}},
+			},
+			wantErr: `containers.main.files./etc/app.conf: volume name "file-3e43d1ed18" is already used by a volume resource`,
 		},
 		{
 			name:      "liveness probe without handler",
@@ -203,9 +210,12 @@ func TestContainersErrors(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := &builder{
-				workload: score.Workload{Containers: score.WorkloadContainers{"main": tc.container}},
+				workload: score.Workload{
+					Containers: score.WorkloadContainers{"main": tc.container},
+					Resources:  score.WorkloadResources{"file-3e43d1ed18": {Type: "volume"}},
+				},
 				substitutions: score.Substitutions{
-					"resources.db.password": {Secret: &score.SecretRef{Type: score.SecretTypeDirect, Value: "s3cr3t"}},
+					"resources.file-3e43d1ed18": {Value: map[string]any{"kubernetes": map[string]any{"emptyDir": map[string]any{}}}},
 				},
 			}
 			_, err := b.containers()
@@ -297,7 +307,7 @@ func TestEnvVarsErrors(t *testing.T) {
 		{
 			name:    "secret key collision",
 			vars:    score.ContainerVariables{"A B": "${resources.db.password}", "A_B": "${resources.db.password}"},
-			wantErr: `key "env.main.A_B" is already used by another variable or file`,
+			wantErr: `secret key "env.main.A_B" is already used by another variable`,
 		},
 	}
 	for _, tc := range testCases {
@@ -316,7 +326,6 @@ func TestVolumeMountsErrors(t *testing.T) {
 	resources := score.WorkloadResources{
 		"data":        {Type: "volume"},
 		"db":          {Type: "postgres"},
-		"files":       {Type: "volume"},
 		"missing":     {Type: "volume"},
 		"no-platform": {Type: "volume"},
 		"not-object":  {Type: "volume"},
@@ -340,7 +349,6 @@ func TestVolumeMountsErrors(t *testing.T) {
 		{name: "not a resources placeholder", source: "${metadata.name}", wantErr: "source must be ${resources.NAME}"},
 		{name: "unknown resource", source: "${resources.unknown}", wantErr: "source ${resources.unknown} must reference a resource of type volume"},
 		{name: "not a volume resource", source: "${resources.db}", wantErr: "source ${resources.db} must reference a resource of type volume"},
-		{name: "reserved volume name", source: "${resources.files}", wantErr: `source ${resources.files}: the volume name "files" is reserved for container files`},
 		{name: "missing substitution", source: "${resources.missing}", wantErr: `resolving placeholder "resources.missing": no substitution found`},
 		{name: "no kubernetes key", source: "${resources.no-platform}", wantErr: "must be an object with a kubernetes key holding a volume source"},
 		{name: "substitution not an object", source: "${resources.not-object}", wantErr: "must be an object with a kubernetes key holding a volume source"},

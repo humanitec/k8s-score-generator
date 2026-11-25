@@ -37,20 +37,16 @@ import (
 const (
 	// DeploymentManifestKey manifest key to hold the Deployment. Always present.
 	DeploymentManifestKey = "deployment"
-	// SecretManifestKey manifest key to hold a Secret with the workload's secret values and the files that use them.
-	// Present only when the workload has any.
+	// SecretManifestKey manifest key to hold a Secret with the workload's secrets. Present only when the workload has any.
 	SecretManifestKey = "secret"
-	// ConfigMapManifestKey manifest key to hold a ConfigMap with the workload's files without secret values.
-	// Present only when the workload has any.
-	ConfigMapManifestKey = "configmap"
 	// ServiceManifestKey manifest key to hold a Service. Present only when the workload has service ports.
 	ServiceManifestKey = "service"
 
 	// NameLabel is the label that selects the workload's pods. Its value is metadata.name.
 	NameLabel = "app.kubernetes.io/name"
 
-	// ConfigChecksumAnnotation is the pod's annotation to hash the data of its Secret and ConfigMap, to restart
-	// the pod when values or files changed.
+	// ConfigChecksumAnnotation is the pod's annotation to hash its secret values and files, to restart
+	// the pod when they changed.
 	ConfigChecksumAnnotation = "score.dev/config-checksum"
 )
 
@@ -67,9 +63,10 @@ func NewGenerator() *Generator {
 // Generate generates the Kubernetes manifests from the score spec and the substitution map.
 // It returns (all named after metadata.name):
 //   - a Deployment
-//   - a Secret, if the workload has secret values or files with secret values
-//   - a ConfigMap, if the workload has files without secret values
+//   - a Secret, if the workload has secret values
 //   - a Service, if the workload has service ports
+//
+// It also returns a ConfigMap for each container file, or a Secret if the file uses a secret value.
 func (g *Generator) Generate(_ context.Context, spec *score.Workload, substitutions score.Substitutions) (map[string][]byte, error) {
 	if spec == nil {
 		return nil, fmt.Errorf("no workload to generate Kubernetes manifests from")
@@ -101,30 +98,34 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 		}
 	}
 
-	if len(b.configData) > 0 {
+	filesData := make(map[string][]byte, len(b.files))
+	for volumeName, f := range b.files {
+		meta := metav1.ObjectMeta{Name: f.object, Labels: labels}
+		filesData[volumeName] = f.content
+		if f.secret {
+			manifests[volumeName] = &corev1.Secret{
+				TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+				ObjectMeta: meta,
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{f.key: f.content},
+			}
+			continue
+		}
 		configMap := &corev1.ConfigMap{
 			TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-			ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+			ObjectMeta: meta,
 		}
 		// data holds UTF-8 strings only, so any other content goes to binaryData.
-		for key, value := range b.configData {
-			if utf8.Valid(value) {
-				if configMap.Data == nil {
-					configMap.Data = map[string]string{}
-				}
-				configMap.Data[key] = string(value)
-			} else {
-				if configMap.BinaryData == nil {
-					configMap.BinaryData = map[string][]byte{}
-				}
-				configMap.BinaryData[key] = value
-			}
+		if utf8.Valid(f.content) {
+			configMap.Data = map[string]string{f.key: string(f.content)}
+		} else {
+			configMap.BinaryData = map[string][]byte{f.key: f.content}
 		}
-		manifests[ConfigMapManifestKey] = configMap
+		manifests[volumeName] = configMap
 	}
 
-	if len(b.secretData) > 0 || len(b.configData) > 0 {
-		checksum, err := configChecksum(b.secretData, b.configData)
+	if len(b.secretData) > 0 || len(filesData) > 0 {
+		checksum, err := configChecksum(b.secretData, filesData)
 		if err != nil {
 			return nil, err
 		}
@@ -169,11 +170,12 @@ func (g *Generator) Generate(_ context.Context, spec *score.Workload, substituti
 	return out, nil
 }
 
-// configChecksum returns a hash of the Secret and ConfigMap data. json.Marshal sorts map keys, so it is stable.
-func configChecksum(secretData, configData map[string][]byte) (string, error) {
-	raw, err := json.Marshal([]map[string][]byte{secretData, configData})
+// configChecksum returns a hash of the secret values and the file contents by volume name.
+// json.Marshal sorts map keys, so it is stable.
+func configChecksum(secretData, filesData map[string][]byte) (string, error) {
+	raw, err := json.Marshal([]map[string][]byte{secretData, filesData})
 	if err != nil {
-		return "", fmt.Errorf("hashing the secret and config data: %w", err)
+		return "", fmt.Errorf("hashing the secret values and files: %w", err)
 	}
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:]), nil
