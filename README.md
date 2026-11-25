@@ -33,7 +33,7 @@ metadata:
   name: hello-world
 containers:
   main:
-    image: ghcr.io/example/hello-world:latest
+    image: nginx:1.27
     variables:
       DB_HOST: ${resources.db.host}
       DB_PASSWORD: ${resources.db.password}
@@ -49,7 +49,6 @@ service:
   ports:
     http:
       port: 80
-      targetPort: 8080
 resources:
   db:
     type: postgres
@@ -109,7 +108,7 @@ This generates:
 - a `Deployment` with `DB_HOST` set as a plain value, `DB_PASSWORD` referenced from the `Secret`,
   the volume `data` mounted at `/data`, and the file mounted at `/etc/app/config.yaml`.
 - a `Secret` with the value of `DB_PASSWORD`.
-- a `Service` that forwards port 80 to port 8080 of the pods.
+- a `Service` that forwards port 80 to the pods.
 - a `ConfigMap` with the content of `/etc/app/config.yaml`, with `${resources.db.host}` replaced.
 
 ### Manifests
