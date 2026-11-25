@@ -43,10 +43,11 @@ func TestContainers(t *testing.T) {
 						"/cache":  {Source: "${resources.cache}", ReadOnly: new(false)},
 					},
 					Files: score.ContainerFiles{
-						"/etc/app/config.yaml":  {Content: new("host: ${resources.db.host}"), Mode: new("0644")},
-						"/etc/app/secret.yaml":  {Content: new("password: ${resources.db.password}"), Mode: new("0600")},
-						"/etc/app/template.txt": {Content: new("password: ${resources.db.password}"), NoExpand: new(true)},
-						"/bin/tool":             {BinaryContent: new("AAE=")},
+						"/etc/app/config.yaml":       {Content: new("host: ${resources.db.host}"), Mode: new("0644")},
+						"/etc/app/secret.yaml":       {Content: new("password: ${resources.db.password}"), Mode: new("0600")},
+						"/etc/app/template.txt":      {Content: new("password: ${resources.db.password}"), NoExpand: new(true)},
+						"/etc/app/test file (1).txt": {Content: new("test")},
+						"/bin/tool":                  {BinaryContent: new("AAE=")},
 					},
 					Resources: &score.ContainerResources{
 						Requests: &score.ResourcesLimits{Cpu: new("250m"), Memory: new("64Mi")},
@@ -85,6 +86,7 @@ func TestContainers(t *testing.T) {
 				{Name: "file-782352c4e0", MountPath: "/etc/app/config.yaml", SubPath: "config.yaml", ReadOnly: true},
 				{Name: "file-4abb8b2beb", MountPath: "/etc/app/secret.yaml", SubPath: "secret.yaml", ReadOnly: true},
 				{Name: "file-6f9f7b4538", MountPath: "/etc/app/template.txt", SubPath: "template.txt", ReadOnly: true},
+				{Name: "file-74365f4c4f", MountPath: "/etc/app/test file (1).txt", SubPath: "test_file__1_.txt", ReadOnly: true},
 			},
 			Resources: corev1.ResourceRequirements{
 				Requests: corev1.ResourceList{
@@ -125,6 +127,9 @@ func TestContainers(t *testing.T) {
 		"file-6f9f7b4538": {Name: "file-6f9f7b4538", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
 			LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-6f9f7b4538"},
 		}}},
+		"file-74365f4c4f": {Name: "file-74365f4c4f", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+			LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-74365f4c4f"},
+		}}},
 	}, b.volumes, "a volume mounted twice is added once, each file has its own volume")
 	contents := map[string]string{}
 	secrets := map[string]bool{}
@@ -133,16 +138,18 @@ func TestContainers(t *testing.T) {
 		secrets[f.object] = f.secret
 	}
 	assert.Equal(t, map[string]string{
-		"app-file-2031ebf787/tool":         "\x00\x01",
-		"app-file-782352c4e0/config.yaml":  "host: 10.0.0.5",
-		"app-file-4abb8b2beb/secret.yaml":  "password: s3cr3t",
-		"app-file-6f9f7b4538/template.txt": "password: ${resources.db.password}",
-	}, contents, "each file is stored under its base name")
+		"app-file-2031ebf787/tool":              "\x00\x01",
+		"app-file-782352c4e0/config.yaml":       "host: 10.0.0.5",
+		"app-file-4abb8b2beb/secret.yaml":       "password: s3cr3t",
+		"app-file-6f9f7b4538/template.txt":      "password: ${resources.db.password}",
+		"app-file-74365f4c4f/test_file__1_.txt": "test",
+	}, contents, "each file is stored under its base name, with characters that are not allowed in keys replaced")
 	assert.Equal(t, map[string]bool{
 		"app-file-2031ebf787": false,
 		"app-file-782352c4e0": false,
 		"app-file-4abb8b2beb": true,
 		"app-file-6f9f7b4538": false,
+		"app-file-74365f4c4f": false,
 	}, secrets, "only a file with a secret value is stored in a Secret")
 	assert.Empty(t, b.secretData, "files are not stored in the variables' Secret")
 }
