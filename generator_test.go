@@ -16,6 +16,8 @@ package k8s
 
 import (
 	"encoding/json"
+	"maps"
+	"slices"
 	"testing"
 
 	"github.com/score-spec/score-go/v2/score"
@@ -45,6 +47,7 @@ func TestGenerate(t *testing.T) {
 			"sidecar": {
 				Image:     "busybox",
 				Variables: score.ContainerVariables{"PASSWORD": "${resources.db.password}"},
+				Files:     score.ContainerFiles{"/etc/sidecar/password": {Content: new("${resources.db.password}"), Mode: new("0400")}},
 			},
 		},
 		Service: &score.WorkloadService{Ports: score.WorkloadServicePorts{
@@ -56,27 +59,20 @@ func TestGenerate(t *testing.T) {
 	dataVolume := score.SubValue{Value: map[string]any{
 		"kubernetes": map[string]any{"persistentVolumeClaim": map[string]any{"claimName": "data"}},
 	}}
-	// generate runs Generate with the given substitutions and decodes the manifests.
-	// The Secret, the ConfigMap and the Service are nil when they are not generated.
-	generate := func(subs score.Substitutions) (appsv1.Deployment, *corev1.Secret, *corev1.ConfigMap, *corev1.Service) {
+	// generate runs Generate with the given substitutions and returns the decoded Deployment and all manifests.
+	generate := func(subs score.Substitutions) (appsv1.Deployment, map[string][]byte) {
 		t.Helper()
 		manifests, err := NewGenerator().Generate(t.Context(), &workload, subs)
 		require.NoError(t, err)
 		var deployment appsv1.Deployment
 		require.NoError(t, json.Unmarshal(manifests[DeploymentManifestKey], &deployment))
-		var secret *corev1.Secret
-		if raw, ok := manifests[SecretManifestKey]; ok {
-			require.NoError(t, json.Unmarshal(raw, &secret))
-		}
-		var configMap *corev1.ConfigMap
-		if raw, ok := manifests[ConfigMapManifestKey]; ok {
-			require.NoError(t, json.Unmarshal(raw, &configMap))
-		}
-		var service *corev1.Service
-		if raw, ok := manifests[ServiceManifestKey]; ok {
-			require.NoError(t, json.Unmarshal(raw, &service))
-		}
-		return deployment, secret, configMap, service
+		return deployment, manifests
+	}
+	// decode decodes a manifest that must be present.
+	decode := func(manifests map[string][]byte, key string, into any) {
+		t.Helper()
+		require.Contains(t, manifests, key)
+		require.NoError(t, json.Unmarshal(manifests[key], into))
 	}
 
 	// Generate successfully and check the output
@@ -85,7 +81,10 @@ func TestGenerate(t *testing.T) {
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 		"resources.data":        dataVolume,
 	}
-	deployment, secret, configMap, service := generate(subs)
+	deployment, manifests := generate(subs)
+	assert.ElementsMatch(t, []string{
+		DeploymentManifestKey, SecretManifestKey, ServiceManifestKey, "file-460aa9d64a", "file-948f566ff2", "file-cce82742d2",
+	}, slices.Collect(maps.Keys(manifests)), "a manifest for each file, keyed by its volume name")
 
 	labels := map[string]string{NameLabel: "app"}
 	assert.Equal(t, "apps/v1", deployment.APIVersion)
@@ -101,7 +100,9 @@ func TestGenerate(t *testing.T) {
 				LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
 				Key:                  "env.sidecar.PASSWORD",
 			}},
-		}}},
+		}}, VolumeMounts: []corev1.VolumeMount{
+			{Name: "file-460aa9d64a", MountPath: "/etc/sidecar/password", SubPath: "password", ReadOnly: true},
+		}},
 		{
 			Name:    "web",
 			Image:   "nginx:1.27",
@@ -110,8 +111,8 @@ func TestGenerate(t *testing.T) {
 			Env:     []corev1.EnvVar{{Name: "DB_HOST", Value: "hostname"}},
 			VolumeMounts: []corev1.VolumeMount{
 				{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: new(corev1.RecursiveReadOnlyIfPossible)},
-				{Name: "files", MountPath: "/etc/nginx/conf.d/app.conf", SubPath: "file.web._etc_nginx_conf.d_app.conf", ReadOnly: true},
-				{Name: "files", MountPath: "/usr/share/nginx/html/favicon.ico", SubPath: "file.web._usr_share_nginx_html_favicon.ico", ReadOnly: true},
+				{Name: "file-cce82742d2", MountPath: "/etc/nginx/conf.d/app.conf", SubPath: "app.conf", ReadOnly: true},
+				{Name: "file-948f566ff2", MountPath: "/usr/share/nginx/html/favicon.ico", SubPath: "favicon.ico", ReadOnly: true},
 			},
 		},
 	}, deployment.Spec.Template.Spec.Containers, "containers are sorted by name")
@@ -121,20 +122,25 @@ func TestGenerate(t *testing.T) {
 			VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: "data"}},
 		},
 		{
-			Name: "files",
-			VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{Sources: []corev1.VolumeProjection{{
-				ConfigMap: &corev1.ConfigMapProjection{
-					LocalObjectReference: corev1.LocalObjectReference{Name: "app"},
-					Items: []corev1.KeyToPath{
-						{Key: "file.web._etc_nginx_conf.d_app.conf", Path: "file.web._etc_nginx_conf.d_app.conf"},
-						{Key: "file.web._usr_share_nginx_html_favicon.ico", Path: "file.web._usr_share_nginx_html_favicon.ico"},
-					},
-				},
-			}}}},
+			Name:         "file-460aa9d64a",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "app-file-460aa9d64a", DefaultMode: new(int32(0o400))}},
+		},
+		{
+			Name: "file-948f566ff2",
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-948f566ff2"},
+			}},
+		},
+		{
+			Name: "file-cce82742d2",
+			VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "app-file-cce82742d2"},
+			}},
 		},
 	}, deployment.Spec.Template.Spec.Volumes, "volumes are sorted by name")
 
-	require.NotNil(t, secret)
+	var secret corev1.Secret
+	decode(manifests, SecretManifestKey, &secret)
 	assert.Equal(t, "v1", secret.APIVersion)
 	assert.Equal(t, "Secret", secret.Kind)
 	assert.Equal(t, "app", secret.Name, "the variable references the generated Secret")
@@ -142,19 +148,33 @@ func TestGenerate(t *testing.T) {
 	assert.Equal(t, corev1.SecretTypeOpaque, secret.Type)
 	assert.Equal(t, map[string][]byte{"env.sidecar.PASSWORD": []byte("s3cr3t")}, secret.Data)
 
-	require.NotNil(t, configMap)
+	var fileSecret corev1.Secret
+	decode(manifests, "file-460aa9d64a", &fileSecret)
+	assert.Equal(t, "Secret", fileSecret.Kind)
+	assert.Equal(t, "app-file-460aa9d64a", fileSecret.Name, "the file's volume references the generated Secret")
+	assert.Equal(t, labels, fileSecret.Labels)
+	assert.Equal(t, corev1.SecretTypeOpaque, fileSecret.Type)
+	assert.Equal(t, map[string][]byte{"password": []byte("s3cr3t")}, fileSecret.Data, "a file with a secret value is stored in a Secret")
+
+	var configMap corev1.ConfigMap
+	decode(manifests, "file-cce82742d2", &configMap)
 	assert.Equal(t, "v1", configMap.APIVersion)
 	assert.Equal(t, "ConfigMap", configMap.Kind)
-	assert.Equal(t, "app", configMap.Name, "the files volume references the generated ConfigMap")
+	assert.Equal(t, "app-file-cce82742d2", configMap.Name, "the file's volume references the generated ConfigMap")
 	assert.Equal(t, labels, configMap.Labels)
-	assert.Equal(t, map[string]string{"file.web._etc_nginx_conf.d_app.conf": "upstream db { server hostname; }"}, configMap.Data)
-	assert.Equal(t, map[string][]byte{"file.web._usr_share_nginx_html_favicon.ico": {0x00, 0xff}}, configMap.BinaryData,
-		"content that isn't UTF-8 goes to binaryData")
+	assert.Equal(t, map[string]string{"app.conf": "upstream db { server hostname; }"}, configMap.Data)
+	assert.Empty(t, configMap.BinaryData)
+
+	var binaryConfigMap corev1.ConfigMap
+	decode(manifests, "file-948f566ff2", &binaryConfigMap)
+	assert.Empty(t, binaryConfigMap.Data)
+	assert.Equal(t, map[string][]byte{"favicon.ico": {0x00, 0xff}}, binaryConfigMap.BinaryData, "content that isn't UTF-8 goes to binaryData")
 
 	checksum := deployment.Spec.Template.Annotations[ConfigChecksumAnnotation]
 	assert.NotEmpty(t, checksum)
 
-	require.NotNil(t, service)
+	var service corev1.Service
+	decode(manifests, ServiceManifestKey, &service)
 	assert.Equal(t, "v1", service.APIVersion)
 	assert.Equal(t, "Service", service.Kind)
 	assert.Equal(t, "app", service.Name)
@@ -171,7 +191,7 @@ func TestGenerate(t *testing.T) {
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 		"resources.data":        dataVolume,
 	}
-	same, _, _, _ := generate(subs)
+	same, _ := generate(subs)
 	assert.Equal(t, checksum, same.Spec.Template.Annotations[ConfigChecksumAnnotation], "the checksum is stable")
 
 	// Generate again with a different secret value and check that the checksum changed
@@ -180,7 +200,7 @@ func TestGenerate(t *testing.T) {
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 		"resources.data":        dataVolume,
 	}
-	changed, _, _, _ := generate(subs)
+	changed, _ := generate(subs)
 	assert.NotEqual(t, checksum, changed.Spec.Template.Annotations[ConfigChecksumAnnotation], "a new secret value rolls out new pods")
 
 	// Generate again with a different file content and check that the checksum changed
@@ -189,25 +209,24 @@ func TestGenerate(t *testing.T) {
 		"resources.db.host":     score.SubValue{Value: "changed"},
 		"resources.data":        dataVolume,
 	}
-	changed, _, _, _ = generate(subs)
+	changed, _ = generate(subs)
 	assert.NotEqual(t, checksum, changed.Spec.Template.Annotations[ConfigChecksumAnnotation], "a new file content rolls out new pods")
 
-	// Generate again without secret values, files and service ports and check that there is no Secret,
-	// no ConfigMap, no checksum and no Service
+	// Generate again without secret values, files and service ports and check that there is only the
+	// Deployment, without a checksum
 	workload.Service = nil
-	web := workload.Containers["web"]
-	web.Files = nil
-	workload.Containers["web"] = web
+	for name, c := range workload.Containers {
+		c.Files = nil
+		workload.Containers[name] = c
+	}
 	subs = score.Substitutions{
 		"resources.db.password": score.SubValue{Value: "not-a-secret"},
 		"resources.db.host":     score.SubValue{Value: "hostname"},
 		"resources.data":        dataVolume,
 	}
-	plain, secret, configMap, service := generate(subs)
-	assert.Nil(t, secret, "no Secret without secret values")
-	assert.Nil(t, configMap, "no ConfigMap without files")
-	assert.Empty(t, plain.Spec.Template.Annotations, "no checksum without a Secret or a ConfigMap")
-	assert.Nil(t, service, "no Service without service ports")
+	plain, manifests := generate(subs)
+	assert.Equal(t, []string{DeploymentManifestKey}, slices.Collect(maps.Keys(manifests)), "only the Deployment")
+	assert.Empty(t, plain.Spec.Template.Annotations, "no checksum without secret values and files")
 }
 
 func TestGenerateErrors(t *testing.T) {
