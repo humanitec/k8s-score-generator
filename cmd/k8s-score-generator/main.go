@@ -18,7 +18,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -122,7 +121,7 @@ func parse(fs *flag.FlagSet, args []string) error {
 }
 
 func runGenerate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	fs := newFlagSet("generate", `Generates the Kubernetes manifests for a Score workload, as YAML documents or as a JSON List.
+	fs := newFlagSet("generate", `Generates the Kubernetes manifests for a Score workload, as YAML documents or as JSON objects.
 The manifests are sorted by their key, and can be applied with "kubectl apply -f".
 
 Only ${resources.*} placeholders are resolved. The Score specification must be normalized.
@@ -170,20 +169,11 @@ The manifests include Secrets with the workload's secret values, so handle the o
 			out.Write(doc)
 		}
 	} else {
-		list := struct {
-			APIVersion string            `json:"apiVersion"`
-			Kind       string            `json:"kind"`
-			Items      []json.RawMessage `json:"items"`
-		}{APIVersion: "v1", Kind: "List"}
+		// The manifests as generated, one JSON object per line.
 		for _, key := range keys {
-			list.Items = append(list.Items, manifests[key])
+			out.Write(manifests[key])
+			out.WriteByte('\n')
 		}
-		raw, err := json.Marshal(list)
-		if err != nil {
-			return fmt.Errorf("serializing the manifests to json: %w", err)
-		}
-		out.Write(raw)
-		out.WriteByte('\n')
 	}
 	if _, err := stdout.Write(out.Bytes()); err != nil {
 		return fmt.Errorf("writing the manifests: %w", err)

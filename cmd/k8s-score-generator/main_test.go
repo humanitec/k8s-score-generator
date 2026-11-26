@@ -103,10 +103,11 @@ func TestGenerate(t *testing.T) {
 
 			var objects []unstructured.Unstructured
 			if tc.wantJSON {
-				var list unstructured.UnstructuredList
-				require.NoError(t, json.Unmarshal([]byte(stdout), &list))
-				assert.Equal(t, "List", list.GetKind())
-				objects = list.Items
+				for line := range strings.Lines(stdout) {
+					var object unstructured.Unstructured
+					require.NoError(t, json.Unmarshal([]byte(line), &object.Object))
+					objects = append(objects, object)
+				}
 			} else {
 				require.True(t, strings.HasPrefix(stdout, "---\n"), stdout)
 				for doc := range strings.SplitSeq(strings.TrimPrefix(stdout, "---\n"), "\n---\n") {
