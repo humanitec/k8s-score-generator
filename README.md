@@ -1,6 +1,6 @@
 # k8s-score-generator
 
-A Go library that turns a [Score](https://score.dev) workload into Kubernetes manifests: a
+A Go library and command line tool that turn a [Score](https://score.dev) workload into Kubernetes manifests: a
 `Deployment`, and the `Service`, `Secret` and `ConfigMap` objects it needs.
 
 `k8s.Generator` implements the `score.Generator` interface from
@@ -9,8 +9,16 @@ can be combined with any `score.Normalizer` and `score.Provisioner`.
 
 ## Installation
 
+As a library:
+
 ```sh
 go get github.com/humanitec/k8s-score-generator@latest
+```
+
+As a command line tool:
+
+```sh
+go install github.com/humanitec/k8s-score-generator/cmd/k8s-score-generator@latest
 ```
 
 The package is named `k8s`, not after the module path, so you refer to it as `k8s.Generator`.
@@ -25,7 +33,7 @@ metadata:
   name: hello-world
 containers:
   main:
-    image: ghcr.io/example/hello-world:latest
+    image: nginx:1.27
     variables:
       DB_HOST: ${resources.db.host}
       DB_PASSWORD: ${resources.db.password}
@@ -41,7 +49,6 @@ service:
   ports:
     http:
       port: 80
-      targetPort: 8080
 resources:
   db:
     type: postgres
@@ -101,7 +108,7 @@ This generates:
 - a `Deployment` with `DB_HOST` set as a plain value, `DB_PASSWORD` referenced from the `Secret`,
   the volume `data` mounted at `/data`, and the file mounted at `/etc/app/config.yaml`.
 - a `Secret` with the value of `DB_PASSWORD`.
-- a `Service` that forwards port 80 to port 8080 of the pods.
+- a `Service` that forwards port 80 to the pods.
 - a `ConfigMap` with the content of `/etc/app/config.yaml`, with `${resources.db.host}` replaced.
 
 ### Manifests
@@ -190,3 +197,36 @@ example with the name label:
 ```sh
 kubectl apply --prune -l app.kubernetes.io/name=hello-world -f manifests/
 ```
+
+## Command line tool
+
+`k8s-score-generator generate` prints the manifests as YAML documents, or as JSON objects 
+with `--output json`, sorted by their manifest key. The workload and the substitutions are
+read from YAML or JSON files. The substitutions file maps placeholders to values, in the format of
+`score.Substitutions`:
+
+```yaml
+resources.db.host:
+  value: 10.0.0.5
+resources.db.password:
+  secret:
+    type: direct
+    value: s3cr3t
+resources.data:
+  value:
+    kubernetes:
+      persistentVolumeClaim:
+        claimName: hello-world-data
+```
+
+The tool runs no normalizer or provisioner. Only `${resources.*}` placeholders are resolved.
+
+```sh
+k8s-score-generator generate --file score.yaml --substitutions subs.yaml > manifests.yaml
+kubectl apply -f manifests.yaml
+```
+
+The output includes the `Secret`s with the workload's secret values, so handle it as sensitive.
+
+Run `k8s-score-generator --help` or `k8s-score-generator generate --help` for all flags. The tool
+exits with code 2 for usage errors and 1 for other errors.
