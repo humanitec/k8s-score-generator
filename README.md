@@ -202,8 +202,8 @@ kubectl apply --prune -l app.kubernetes.io/name=hello-world -f manifests/
 
 `k8s-score-generator generate` prints the manifests as YAML documents, or as a JSON `List` with
 `--output json`, sorted by their manifest key. The workload and the substitutions are read from
-`.yaml`, `.yml` or `.json` files. The format is chosen by the file extension. The substitutions
-file maps placeholders to values, in the format of `score.Substitutions`:
+YAML or JSON files. The substitutions file maps placeholders to values, in the format of
+`score.Substitutions`:
 
 ```yaml
 resources.db.host:

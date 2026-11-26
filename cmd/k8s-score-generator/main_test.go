@@ -87,7 +87,6 @@ func TestGenerate(t *testing.T) {
 	}{
 		{name: "yaml by default", workloadFile: "score.yaml", substitutionsFile: "subs.yml"},
 		{name: "json", workloadFile: "score.json", substitutionsFile: "subs.json", output: "json", wantJSON: true},
-		{name: "mixed inputs", workloadFile: "score.YAML", substitutionsFile: "subs.json", output: "yaml"},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -147,7 +146,6 @@ func TestUsageErrors(t *testing.T) {
 		{name: "positional arguments", args: []string{"generate", "--file", workload, "extra"}, wantErr: "unexpected arguments: extra"},
 		{name: "generate without file", args: []string{"generate"}, wantErr: "--file is required"},
 		{name: "unknown output format", args: []string{"generate", "--file", workload, "--output", "toml"}, wantErr: `--output must be yaml or json, got "toml"`},
-		{name: "unsupported extension", args: []string{"generate", "--file", "score.toml"}, wantErr: `unsupported file extension ".toml"`},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {

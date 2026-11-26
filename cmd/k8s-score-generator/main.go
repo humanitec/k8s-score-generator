@@ -26,7 +26,6 @@ import (
 	"maps"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -129,8 +128,8 @@ The manifests are sorted by their key, and can be applied with "kubectl apply -f
 Only ${resources.*} placeholders are resolved. The Score specification must be normalized.
 
 The manifests include Secrets with the workload's secret values, so handle the output as sensitive.`, stderr)
-	file := fs.String("file", "", "Score workload file, .yaml, .yml or .json (required)")
-	subsFile := fs.String("substitutions", "", "substitutions file, .yaml, .yml or .json: a map of placeholders, such as resources.db.host, to {value: ...} or {secret: {type: direct, value: ...}}")
+	file := fs.String("file", "", "Score workload file, YAML or JSON (required)")
+	subsFile := fs.String("substitutions", "", "substitutions file, YAML or JSON: a map of placeholders, such as resources.db.host, to {value: ...} or {secret: {type: direct, value: ...}}")
 	output := fs.String("output", "yaml", "output format: yaml or json")
 	if err := parse(fs, args); err != nil {
 		return err
@@ -192,24 +191,13 @@ The manifests include Secrets with the workload's secret values, so handle the o
 	return nil
 }
 
-// readFile decodes the file at path into out, as JSON or YAML depending on its extension.
+// readFile decodes the YAML or JSON file at path into out.
 func readFile(path string, out any) error {
-	ext := strings.ToLower(filepath.Ext(path))
-	var unmarshal func([]byte, any) error
-	switch ext {
-	case ".json":
-		unmarshal = json.Unmarshal
-	case ".yaml", ".yml":
-		unmarshal = func(b []byte, v any) error { return yaml.Unmarshal(b, v) }
-	default:
-		return usageErrorf("%s: unsupported file extension %q, expected .yaml, .yml or .json", path, ext)
-	}
-
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	if err := unmarshal(raw, out); err != nil {
+	if err := yaml.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	return nil
